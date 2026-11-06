@@ -17,9 +17,11 @@ import (
 	"github.com/smallstep/pkcs7"
 )
 
-// The pkcs7 library only encrypts with DES-CBC, AES-128 and AES-256, and only
-// decrypts those plus DES-EDE3. This file builds and opens CMS EnvelopedData
-// (RFC 5652, section 6) with AES-CBC of any key size, so AES-192 works too.
+// The pkcs7 library neither encrypts nor decrypts AES-192, and its RSAES-OAEP
+// key transport support is incomplete. This file builds and opens CMS
+// EnvelopedData (RFC 5652, section 6) with AES-CBC of any key size and opens
+// content keys wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is
+// left to the library.
 
 var (
 	oidAES128CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
@@ -149,9 +151,23 @@ func (alg aesCBC) encrypt(content []byte, recipients []*x509.Certificate) ([]byt
 	})
 }
 
-// decryptEnvelope opens a DER encoded, AES-CBC encrypted EnvelopedData
+// decryptEnvelope opens a BER or DER encoded, AES-CBC encrypted EnvelopedData
 // addressed to cert, using its RSA private key.
-func decryptEnvelope(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+func decryptEnvelope(ber []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	ed, err := parseEnvelope(ber)
+	if err != nil {
+		return nil, err
+	}
+	return ed.decrypt(cert, key)
+}
+
+// parseEnvelope parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
+// accepts BER, which CMS encoders streaming their output produce.
+func parseEnvelope(ber []byte) (*envelopedData, error) {
+	der, err := berToDER(ber)
+	if err != nil {
+		return nil, err
+	}
 	var ci contentInfo
 	if rest, err := asn1.Unmarshal(der, &ci); err != nil {
 		return nil, fmt.Errorf("envelope: parse content info: %w", err)
@@ -165,15 +181,42 @@ func decryptEnvelope(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([
 	if _, err := asn1.Unmarshal(ci.Content.Bytes, &ed); err != nil {
 		return nil, fmt.Errorf("envelope: parse enveloped data: %w", err)
 	}
+	return &ed, nil
+}
 
-	var recipient *recipientInfo
+// recipientFor returns the RecipientInfo addressed to cert, or nil.
+func (ed *envelopedData) recipientFor(cert *x509.Certificate) *recipientInfo {
 	for i := range ed.RecipientInfos {
 		ias := ed.RecipientInfos[i].IssuerAndSerialNumber
 		if bytes.Equal(ias.IssuerName.FullBytes, cert.RawIssuer) && ias.SerialNumber.Cmp(cert.SerialNumber) == 0 {
-			recipient = &ed.RecipientInfos[i]
-			break
+			return &ed.RecipientInfos[i]
 		}
 	}
+	return nil
+}
+
+// needsOwnDecrypter reports whether the envelope addressed to cert has to be
+// opened by decrypt rather than the pkcs7 library. pkcs7 (v0.1.1) cannot
+// decrypt AES-192, and its RSAES-OAEP support rejects absent or NULL
+// parameters and ignores the label and the MGF1 hash. Since it unwraps the
+// content key before looking at the content cipher, its errors cannot be used
+// to detect these cases after the fact.
+func (ed *envelopedData) needsOwnDecrypter(cert *x509.Certificate) bool {
+	alg := ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
+	if _, ok := aesCBCByOID(alg); !ok {
+		return false // DES, 3DES, AES-GCM: only the library can open these
+	}
+	if alg.Equal(oidAES192CBC) {
+		return true
+	}
+	recipient := ed.recipientFor(cert)
+	return recipient != nil && recipient.KeyEncryptionAlgorithm.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP)
+}
+
+// decrypt opens an AES-CBC encrypted envelope addressed to cert, using its RSA
+// private key.
+func (ed *envelopedData) decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	recipient := ed.recipientFor(cert)
 	if recipient == nil {
 		return nil, errors.New("envelope: no recipient info for the signer certificate")
 	}
@@ -333,6 +376,122 @@ func encryptedContentBytes(v asn1.RawValue) ([]byte, error) {
 		buf.Write(part)
 	}
 	return buf.Bytes(), nil
+}
+
+// maxBERDepth bounds the recursion of berToDER; CMS envelopes nest far less.
+const maxBERDepth = 32
+
+var errBERTruncated = errors.New("envelope: truncated BER element")
+
+// berToDER rewrites the lengths of a BER element in the form encoding/asn1
+// requires: indefinite lengths become definite and every length is minimally
+// encoded. Constructed strings are kept as they are (encryptedContentBytes
+// joins them), which is all the EnvelopedData parsing here needs.
+func berToDER(ber []byte) ([]byte, error) {
+	der, rest, err := berElementToDER(ber, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("envelope: trailing data after BER element")
+	}
+	return der, nil
+}
+
+// berElementToDER converts the first element of b and returns the rest of b.
+func berElementToDER(b []byte, depth int) (der, rest []byte, err error) {
+	if depth > maxBERDepth {
+		return nil, nil, errors.New("envelope: BER nesting too deep")
+	}
+	if len(b) == 0 {
+		return nil, nil, errBERTruncated
+	}
+
+	// identifier octets: one, or more for high tag numbers
+	i := 1
+	if b[0]&0x1f == 0x1f {
+		for {
+			if i >= len(b) {
+				return nil, nil, errBERTruncated
+			}
+			i++
+			if b[i-1]&0x80 == 0 {
+				break
+			}
+		}
+	}
+	identifier := b[:i]
+	constructed := b[0]&0x20 != 0
+
+	if i >= len(b) {
+		return nil, nil, errBERTruncated
+	}
+	var content []byte
+	switch l := b[i]; {
+	case l == 0x80: // indefinite length: children up to the end-of-contents octets
+		if !constructed {
+			return nil, nil, errors.New("envelope: indefinite length on a primitive BER element")
+		}
+		rest = b[i+1:]
+		for {
+			if len(rest) >= 2 && rest[0] == 0 && rest[1] == 0 {
+				rest = rest[2:]
+				break
+			}
+			var child []byte
+			if child, rest, err = berElementToDER(rest, depth+1); err != nil {
+				return nil, nil, err
+			}
+			content = append(content, child...)
+		}
+	default:
+		i++
+		n := int(l)
+		if l > 0x80 {
+			numBytes := int(l & 0x7f)
+			if numBytes > 4 {
+				return nil, nil, errors.New("envelope: BER length too large")
+			}
+			if i+numBytes > len(b) {
+				return nil, nil, errBERTruncated
+			}
+			n = 0
+			for _, c := range b[i : i+numBytes] {
+				n = n<<8 | int(c)
+			}
+			i += numBytes
+		}
+		if n < 0 || n > len(b)-i {
+			return nil, nil, errBERTruncated
+		}
+		content, rest = b[i:i+n], b[i+n:]
+		if constructed {
+			var children []byte
+			for r := content; len(r) > 0; {
+				var child []byte
+				if child, r, err = berElementToDER(r, depth+1); err != nil {
+					return nil, nil, err
+				}
+				children = append(children, child...)
+			}
+			content = children
+		}
+	}
+
+	der = append(der, identifier...)
+	der = append(der, derLength(len(content))...)
+	return append(der, content...), rest, nil
+}
+
+func derLength(n int) []byte {
+	if n < 0x80 {
+		return []byte{byte(n)}
+	}
+	var be []byte
+	for ; n > 0; n >>= 8 {
+		be = append([]byte{byte(n)}, be...)
+	}
+	return append([]byte{0x80 | byte(len(be))}, be...)
 }
 
 func pkcs7Pad(data []byte, blockSize int) []byte {

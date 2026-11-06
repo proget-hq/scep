@@ -146,8 +146,8 @@ func newServer(t *testing.T, opts ...scepserver.ServiceOption) (*httptest.Server
 	server := httptest.NewServer(handler)
 	teardown := func() {
 		server.Close()
-		os.Remove("../scep/testdata/testca/serial")
-		os.Remove("../scep/testdata/testca/index.txt")
+		os.Remove("../testdata/testca/serial")
+		os.Remove("../testdata/testca/index.txt")
 	}
 	return server, svc, teardown
 }

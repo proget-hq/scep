@@ -27,12 +27,22 @@ var (
 type envelopeEncrypter func(content []byte, recipients []*x509.Certificate) ([]byte, error)
 
 // encryptionAlgorithms maps -encryption-algorithm values to encrypters.
-// "des" keeps the upstream behaviour (pkcs7.Encrypt defaults to DES-CBC).
+// "des" keeps the upstream behaviour. Only AES-192 needs our own encrypter.
 var encryptionAlgorithms = map[string]envelopeEncrypter{
-	"des":    pkcs7.Encrypt,
-	"aes128": aesCBCAlgorithms[0].encrypt,
+	"des":    pkcs7Encrypter(pkcs7.EncryptionAlgorithmDESCBC),
+	"aes128": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES128CBC),
 	"aes192": aesCBCAlgorithms[1].encrypt,
-	"aes256": aesCBCAlgorithms[2].encrypt,
+	"aes256": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES256CBC),
+}
+
+// pkcs7Encrypter encrypts with the pkcs7 library. The library takes the cipher
+// from a package variable, which is fine for a CLI building one message at a
+// time.
+func pkcs7Encrypter(alg int) envelopeEncrypter {
+	return func(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+		pkcs7.ContentEncryptionAlgorithm = alg
+		return pkcs7.Encrypt(content, recipients)
+	}
 }
 
 // signatureAlgorithms maps -signature-algorithm values to digest OIDs.
@@ -103,22 +113,44 @@ func newCSRRequest(
 	return signedData.Finish()
 }
 
-// decryptCertRep extracts the issued certificate from a successful CertRep
-// whose envelope uses a cipher the pkcs7 library cannot decrypt (AES-192).
+// decryptCertRep returns the certificate issued in a successful CertRep. The
+// envelope is inspected first: the ones the pkcs7 library cannot open (see
+// needsOwnDecrypter) are decrypted here, all others by DecryptPKIEnvelope.
 func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) (*x509.Certificate, error) {
+	ed, parseErr := certRepEnvelope(respMsg)
+	if parseErr == nil && ed.needsOwnDecrypter(cert) {
+		envelope, err := ed.decrypt(cert, key)
+		if err != nil {
+			return nil, err
+		}
+		certs, err := scep.CACerts(envelope)
+		if err != nil {
+			return nil, err
+		}
+		if len(certs) == 0 {
+			return nil, errors.New("scep: no certificate in the CertRep pkiEnvelope")
+		}
+		return certs[0], nil
+	}
+
+	// If our parser failed, the library may still read the envelope; when it
+	// cannot either, report both errors.
+	if err := respMsg.DecryptPKIEnvelope(cert, key); err != nil {
+		if parseErr != nil {
+			return nil, fmt.Errorf("%w (%v)", err, parseErr)
+		}
+		return nil, err
+	}
+	return respMsg.CertRepMessage.Certificate, nil
+}
+
+// certRepEnvelope parses the EnvelopedData signed in a CertRep.
+func certRepEnvelope(respMsg *scep.PKIMessage) (*envelopedData, error) {
 	p7, err := pkcs7.Parse(respMsg.Raw)
 	if err != nil {
 		return nil, err
 	}
-	envelope, err := decryptEnvelope(p7.Content, cert, key)
-	if err != nil {
-		return nil, err
-	}
-	certs, err := scep.CACerts(envelope)
-	if err != nil {
-		return nil, err
-	}
-	return certs[0], nil
+	return parseEnvelope(p7.Content)
 }
 
 func newNonce() (scep.SenderNonce, error) {
