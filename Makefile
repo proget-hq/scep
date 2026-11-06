@@ -5,6 +5,7 @@ OSARCH=$(shell go env GOHOSTOS)-$(shell go env GOHOSTARCH)
 SCEPCLIENT=\
 	scepclient-linux-amd64 \
 	scepclient-linux-arm \
+	scepclient-linux-arm64 \
 	scepclient-darwin-amd64 \
 	scepclient-darwin-arm64 \
 	scepclient-freebsd-amd64 \
@@ -13,6 +14,7 @@ SCEPCLIENT=\
 SCEPSERVER=\
 	scepserver-linux-amd64 \
 	scepserver-linux-arm \
+	scepserver-linux-arm64 \
 	scepserver-darwin-amd64 \
 	scepserver-darwin-arm64 \
 	scepserver-freebsd-amd64 \
