@@ -15,6 +15,7 @@ import (
 	"github.com/smallstep/scep"
 
 	"github.com/micromdm/scep/v2/cryptoutil"
+	"github.com/micromdm/scep/v2/envelope"
 )
 
 var (
@@ -31,7 +32,7 @@ type envelopeEncrypter func(content []byte, recipients []*x509.Certificate) ([]b
 var encryptionAlgorithms = map[string]envelopeEncrypter{
 	"des":    pkcs7Encrypter(pkcs7.EncryptionAlgorithmDESCBC),
 	"aes128": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES128CBC),
-	"aes192": aesCBCAlgorithms[1].encrypt,
+	"aes192": envelope.AES192CBC.Encrypt,
 	"aes256": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES256CBC),
 }
 
@@ -115,15 +116,16 @@ func newCSRRequest(
 
 // decryptCertRep returns the certificate issued in a successful CertRep. The
 // envelope is inspected first: the ones the pkcs7 library cannot open (see
-// needsOwnDecrypter) are decrypted here, all others by DecryptPKIEnvelope.
+// envelope.EnvelopedData.UnsupportedByPKCS7) are decrypted by the envelope
+// package, all others by DecryptPKIEnvelope.
 func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) (*x509.Certificate, error) {
 	ed, parseErr := certRepEnvelope(respMsg)
-	if parseErr == nil && ed.needsOwnDecrypter(cert) {
-		envelope, err := ed.decrypt(cert, key)
+	if parseErr == nil && ed.UnsupportedByPKCS7(cert) {
+		content, err := ed.Decrypt(cert, key)
 		if err != nil {
 			return nil, err
 		}
-		certs, err := scep.CACerts(envelope)
+		certs, err := scep.CACerts(content)
 		if err != nil {
 			return nil, err
 		}
@@ -145,12 +147,12 @@ func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.P
 }
 
 // certRepEnvelope parses the EnvelopedData signed in a CertRep.
-func certRepEnvelope(respMsg *scep.PKIMessage) (*envelopedData, error) {
+func certRepEnvelope(respMsg *scep.PKIMessage) (*envelope.EnvelopedData, error) {
 	p7, err := pkcs7.Parse(respMsg.Raw)
 	if err != nil {
 		return nil, err
 	}
-	return parseEnvelope(p7.Content)
+	return envelope.Parse(p7.Content)
 }
 
 func newNonce() (scep.SenderNonce, error) {

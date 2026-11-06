@@ -75,7 +75,7 @@ func (svc *service) PKIOperation(ctx context.Context, data []byte) ([]byte, erro
 	if err != nil {
 		return nil, err
 	}
-	if err := msg.DecryptPKIEnvelope(svc.crt, svc.key); err != nil {
+	if err := decryptPKIEnvelope(msg, svc.crt, svc.key, svc.debugLogger); err != nil {
 		return nil, err
 	}
 
