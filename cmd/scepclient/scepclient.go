@@ -7,7 +7,6 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/hex"
-	stderrors "errors"
 	"flag"
 	"fmt"
 	"io/ioutil"
@@ -23,7 +22,6 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/go-kit/kit/log/level"
 	"github.com/pkg/errors"
-	"github.com/smallstep/pkcs7"
 	"github.com/smallstep/scep"
 )
 
@@ -206,15 +204,8 @@ func run(cfg runCfg) error {
 		break // on scep.SUCCESS
 	}
 
-	var respCert *x509.Certificate
-	if err := respMsg.DecryptPKIEnvelope(signerCert, key); err == nil {
-		respCert = respMsg.CertRepMessage.Certificate
-	} else if stderrors.Is(err, pkcs7.ErrUnsupportedAlgorithm) {
-		// e.g. AES-192, which the pkcs7 library cannot decrypt
-		if respCert, err = decryptCertRep(respMsg, signerCert, key); err != nil {
-			return errors.Wrapf(err, "decrypt pkiEnvelope, msgType: %s, status %s", msgType, respMsg.PKIStatus)
-		}
-	} else {
+	respCert, err := decryptCertRep(respMsg, signerCert, key)
+	if err != nil {
 		return errors.Wrapf(err, "decrypt pkiEnvelope, msgType: %s, status %s", msgType, respMsg.PKIStatus)
 	}
 

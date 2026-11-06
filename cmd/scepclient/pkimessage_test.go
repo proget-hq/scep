@@ -2,16 +2,19 @@ package main
 
 import (
 	"bytes"
+	"crypto"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
 	"encoding/pem"
+	"errors"
 	"math/big"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -188,6 +191,14 @@ func TestNewCSRRequest(t *testing.T) {
 					t.Errorf("digest algorithm = %s, want %s", got, digest)
 				}
 
+				ed, err := parseEnvelope(p7.Content)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if got := ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm; !got.Equal(encryptionOIDs[encName]) {
+					t.Errorf("content encryption = %s, want %s", got, encryptionOIDs[encName])
+				}
+
 				var envelope []byte
 				if encName == "aes192" {
 					envelope, err = decryptEnvelope(p7.Content, caCert, caKey)
@@ -203,6 +214,13 @@ func TestNewCSRRequest(t *testing.T) {
 			})
 		}
 	}
+}
+
+var encryptionOIDs = map[string]asn1.ObjectIdentifier{
+	"des":    pkcs7.OIDEncryptionAlgorithmDESCBC,
+	"aes128": oidAES128CBC,
+	"aes192": oidAES192CBC,
+	"aes256": oidAES256CBC,
 }
 
 func p7Decrypt(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
@@ -233,36 +251,10 @@ func TestNewCSRRequestRejectsUnselectedRecipients(t *testing.T) {
 	}
 }
 
-// TestDecryptCertRepAES192 builds a CertRep the way a SCEP server answering
-// in AES-192 would, and checks the client gets the issued certificate out.
-func TestDecryptCertRepAES192(t *testing.T) {
-	caCert, caKey := newTestCA(t)
-	clientKey := newTestKey(t)
-	csr := newTestCSR(t, clientKey)
-	signer, err := selfSign(clientKey, csr)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	issuedDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
-		SerialNumber: big.NewInt(7),
-		Subject:      csr.Subject,
-		NotBefore:    time.Now().Add(-time.Minute),
-		NotAfter:     time.Now().Add(time.Hour),
-	}, caCert, &clientKey.PublicKey, caKey)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	degenerate, err := pkcs7.DegenerateCertificate(issuedDER)
-	if err != nil {
-		t.Fatal(err)
-	}
-	envelope, err := aesCBCAlgorithms[1].encrypt(degenerate, []*x509.Certificate{signer})
-	if err != nil {
-		t.Fatal(err)
-	}
-
+// newCertRep builds a successful CertRep carrying envelope, signed by the CA
+// the way a SCEP server would, and parses it as the client does.
+func newCertRep(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey, envelope []byte) *scep.PKIMessage {
+	t.Helper()
 	sd, err := pkcs7.NewSignedData(envelope)
 	if err != nil {
 		t.Fatal(err)
@@ -285,20 +277,120 @@ func TestDecryptCertRepAES192(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-
 	respMsg, err := scep.ParsePKIMessage(raw, scep.WithCACerts([]*x509.Certificate{caCert}))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := respMsg.DecryptPKIEnvelope(signer, clientKey); err != pkcs7.ErrUnsupportedAlgorithm {
-		t.Fatalf("DecryptPKIEnvelope error = %v, want pkcs7.ErrUnsupportedAlgorithm (fallback trigger)", err)
-	}
+	return respMsg
+}
 
-	got, err := decryptCertRep(respMsg, signer, clientKey)
+// TestDecryptCertRep checks the client gets the issued certificate out of
+// CertReps encrypted the ways SCEP servers do, whether the pkcs7 library or
+// decryptEnvelope has to open them.
+func TestDecryptCertRep(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	clientKey := newTestKey(t)
+	csr := newTestCSR(t, clientKey)
+	signer, err := selfSign(clientKey, csr)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !bytes.Equal(got.Raw, issuedDER) {
-		t.Error("decryptCertRep returned a different certificate")
+
+	issuedDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(7),
+		Subject:      csr.Subject,
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, caCert, &clientKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	degenerate, err := pkcs7.DegenerateCertificate(issuedDER)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	oaep := func(hash crypto.Hash, label []byte, params func(t *testing.T) []byte) func(t *testing.T, der []byte) []byte {
+		return func(t *testing.T, der []byte) []byte {
+			return withOAEPKeyTransport(t, der, clientKey, hash, label, params(t))
+		}
+	}
+	for _, tc := range []struct {
+		name       string
+		encryption string
+		rewrap     func(t *testing.T, der []byte) []byte
+		// the pkcs7 library alone cannot open the envelope
+		libraryFails bool
+	}{
+		{name: "DES", encryption: "des"},
+		{name: "AES-128", encryption: "aes128"},
+		{name: "AES-256", encryption: "aes256"},
+		{name: "AES-192", encryption: "aes192", libraryFails: true},
+		{name: "AES-192 BER", encryption: "aes192", libraryFails: true, rewrap: func(t *testing.T, der []byte) []byte {
+			return indefiniteBER(t, der)
+		}},
+		{name: "AES-256 OAEP default parameters", encryption: "aes256", rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
+			return mustMarshal(t, rsaOAEPParameters{})
+		})},
+		{name: "AES-128 OAEP absent parameters", encryption: "aes128", libraryFails: true, rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
+			return nil
+		})},
+		{name: "AES-256 OAEP NULL parameters", encryption: "aes256", libraryFails: true, rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
+			return asn1.NullBytes
+		})},
+		{name: "AES-256 OAEP SHA-256 with label", encryption: "aes256", libraryFails: true, rewrap: oaep(crypto.SHA256, []byte("label"), func(t *testing.T) []byte {
+			return explicitOAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, []byte("label"))
+		})},
+		{name: "AES-192 OAEP SHA-256", encryption: "aes192", libraryFails: true, rewrap: oaep(crypto.SHA256, nil, func(t *testing.T) []byte {
+			return explicitOAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, nil)
+		})},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			envelope, err := encryptionAlgorithms[tc.encryption](degenerate, []*x509.Certificate{signer})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if tc.rewrap != nil {
+				envelope = tc.rewrap(t, envelope)
+			}
+
+			// make sure the case exercises what it claims to
+			err = newCertRep(t, caCert, caKey, envelope).DecryptPKIEnvelope(signer, clientKey)
+			if tc.libraryFails && err == nil {
+				t.Fatal("pkcs7 library opened the envelope, the case does not need decryptEnvelope")
+			} else if !tc.libraryFails && err != nil {
+				t.Fatalf("pkcs7 library: %v", err)
+			}
+
+			got, err := decryptCertRep(newCertRep(t, caCert, caKey, envelope), signer, clientKey)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got.Raw, issuedDER) {
+				t.Error("decryptCertRep returned a different certificate")
+			}
+		})
+	}
+}
+
+func TestDecryptCertRepReportsLibraryAndParseErrors(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	clientKey := newTestKey(t)
+	signer, err := selfSign(clientKey, newTestCSR(t, clientKey))
+	if err != nil {
+		t.Fatal(err)
+	}
+	// signed data instead of enveloped data: neither parser accepts it
+	notEnveloped, err := pkcs7.DegenerateCertificate(caCert.Raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	_, err = decryptCertRep(newCertRep(t, caCert, caKey, notEnveloped), signer, clientKey)
+	if err == nil {
+		t.Fatal("expected an error")
+	}
+	if !errors.Is(err, pkcs7.ErrNotEncryptedContent) || !strings.Contains(err.Error(), "unexpected content type") {
+		t.Errorf("error = %q, want both the library and the envelope parser error", err)
 	}
 }
