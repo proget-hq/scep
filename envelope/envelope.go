@@ -1,0 +1,536 @@
+// Package envelope builds and opens the CMS EnvelopedData (RFC 5652, section 6)
+// of SCEP pkiMessages where the pkcs7 library cannot: it neither encrypts nor
+// decrypts AES-192, and its RSAES-OAEP key transport support is incomplete.
+// Envelopes are built with AES-CBC of any key size and opened when the content
+// key is wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is left
+// to the library; see EnvelopedData.UnsupportedByPKCS7.
+package envelope
+
+import (
+	"bytes"
+	"crypto"
+	"crypto/aes"
+	"crypto/cipher"
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/asn1"
+	"errors"
+	"fmt"
+	"math/big"
+
+	"github.com/smallstep/pkcs7"
+)
+
+var (
+	OIDAES128CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
+	OIDAES192CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 22}
+	OIDAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+
+	oidMGF1       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
+	oidPSpecified = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 9}
+)
+
+// AESCBC is an AES-CBC content encryption algorithm.
+type AESCBC struct {
+	oid    asn1.ObjectIdentifier
+	keyLen int
+}
+
+// The AES-CBC content encryption algorithms.
+var (
+	AES128CBC = AESCBC{oid: OIDAES128CBC, keyLen: 16}
+	AES192CBC = AESCBC{oid: OIDAES192CBC, keyLen: 24}
+	AES256CBC = AESCBC{oid: OIDAES256CBC, keyLen: 32}
+)
+
+var aesCBCAlgorithms = []AESCBC{AES128CBC, AES192CBC, AES256CBC}
+
+// OID returns the content encryption algorithm identifier.
+func (alg AESCBC) OID() asn1.ObjectIdentifier {
+	return alg.oid
+}
+
+func aesCBCByOID(oid asn1.ObjectIdentifier) (AESCBC, bool) {
+	for _, alg := range aesCBCAlgorithms {
+		if alg.oid.Equal(oid) {
+			return alg, true
+		}
+	}
+	return AESCBC{}, false
+}
+
+type contentInfo struct {
+	ContentType asn1.ObjectIdentifier
+	Content     asn1.RawValue `asn1:"explicit,optional,tag:0"`
+}
+
+type envelopedData struct {
+	Version              int
+	RecipientInfos       []recipientInfo `asn1:"set"`
+	EncryptedContentInfo encryptedContentInfo
+}
+
+type recipientInfo struct {
+	Version                int
+	IssuerAndSerialNumber  issuerAndSerial
+	KeyEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedKey           []byte
+}
+
+type issuerAndSerial struct {
+	IssuerName   asn1.RawValue
+	SerialNumber *big.Int
+}
+
+type encryptedContentInfo struct {
+	ContentType                asn1.ObjectIdentifier
+	ContentEncryptionAlgorithm pkix.AlgorithmIdentifier
+	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
+}
+
+// Encrypt wraps content in a DER encoded EnvelopedData readable by every
+// recipient. The content key is transported with RSA PKCS #1 v1.5, as in SCEP.
+func (alg AESCBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	key := make([]byte, alg.keyLen)
+	if _, err := rand.Read(key); err != nil {
+		return nil, err
+	}
+	iv := make([]byte, aes.BlockSize)
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+	block, err := aes.NewCipher(key)
+	if err != nil {
+		return nil, err
+	}
+	ciphertext := pkcs7Pad(content, aes.BlockSize)
+	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, ciphertext)
+
+	ivParam, err := asn1.Marshal(iv)
+	if err != nil {
+		return nil, err
+	}
+
+	recipientInfos := make([]recipientInfo, len(recipients))
+	for i, recipient := range recipients {
+		pub, ok := recipient.PublicKey.(*rsa.PublicKey)
+		if !ok {
+			return nil, fmt.Errorf("envelope: recipient %q does not have an RSA key", recipient.Subject)
+		}
+		encryptedKey, err := rsa.EncryptPKCS1v15(rand.Reader, pub, key)
+		if err != nil {
+			return nil, err
+		}
+		recipientInfos[i] = recipientInfo{
+			Version: 0,
+			IssuerAndSerialNumber: issuerAndSerial{
+				IssuerName:   asn1.RawValue{FullBytes: recipient.RawIssuer},
+				SerialNumber: recipient.SerialNumber,
+			},
+			KeyEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+				Algorithm:  pkcs7.OIDEncryptionAlgorithmRSA,
+				Parameters: asn1.NullRawValue,
+			},
+			EncryptedKey: encryptedKey,
+		}
+	}
+
+	inner, err := asn1.Marshal(envelopedData{
+		Version:        0,
+		RecipientInfos: recipientInfos,
+		EncryptedContentInfo: encryptedContentInfo{
+			ContentType: pkcs7.OIDData,
+			ContentEncryptionAlgorithm: pkix.AlgorithmIdentifier{
+				Algorithm:  alg.oid,
+				Parameters: asn1.RawValue{FullBytes: ivParam},
+			},
+			EncryptedContent: asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: ciphertext},
+		},
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	return asn1.Marshal(contentInfo{
+		ContentType: pkcs7.OIDEnvelopedData,
+		Content:     asn1.RawValue{Class: asn1.ClassContextSpecific, Tag: 0, Bytes: inner, IsCompound: true},
+	})
+}
+
+// Decrypt opens a BER or DER encoded, AES-CBC encrypted EnvelopedData
+// addressed to cert, using its RSA private key.
+func Decrypt(ber []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	ed, err := Parse(ber)
+	if err != nil {
+		return nil, err
+	}
+	return ed.Decrypt(cert, key)
+}
+
+// EnvelopedData is a parsed CMS EnvelopedData.
+type EnvelopedData struct {
+	ed envelopedData
+}
+
+// Parse parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
+// accepts BER, which CMS encoders streaming their output produce.
+func Parse(ber []byte) (*EnvelopedData, error) {
+	der, err := berToDER(ber)
+	if err != nil {
+		return nil, err
+	}
+	var ci contentInfo
+	if rest, err := asn1.Unmarshal(der, &ci); err != nil {
+		return nil, fmt.Errorf("envelope: parse content info: %w", err)
+	} else if len(rest) != 0 {
+		return nil, errors.New("envelope: trailing data after content info")
+	}
+	if !ci.ContentType.Equal(pkcs7.OIDEnvelopedData) {
+		return nil, fmt.Errorf("envelope: unexpected content type %s", ci.ContentType)
+	}
+	var ed envelopedData
+	if _, err := asn1.Unmarshal(ci.Content.Bytes, &ed); err != nil {
+		return nil, fmt.Errorf("envelope: parse enveloped data: %w", err)
+	}
+	return &EnvelopedData{ed: ed}, nil
+}
+
+// ContentEncryptionAlgorithm returns the identifier of the content cipher.
+func (e *EnvelopedData) ContentEncryptionAlgorithm() asn1.ObjectIdentifier {
+	return e.ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
+}
+
+// recipientFor returns the RecipientInfo addressed to cert, or nil.
+func (ed *envelopedData) recipientFor(cert *x509.Certificate) *recipientInfo {
+	for i := range ed.RecipientInfos {
+		ias := ed.RecipientInfos[i].IssuerAndSerialNumber
+		if bytes.Equal(ias.IssuerName.FullBytes, cert.RawIssuer) && ias.SerialNumber.Cmp(cert.SerialNumber) == 0 {
+			return &ed.RecipientInfos[i]
+		}
+	}
+	return nil
+}
+
+// UnsupportedByPKCS7 reports whether the envelope addressed to cert has to be
+// opened by Decrypt rather than the pkcs7 library. pkcs7 (v0.1.1) cannot
+// decrypt AES-192, and its RSAES-OAEP support rejects absent or NULL
+// parameters and ignores the label and the MGF1 hash. Since it unwraps the
+// content key before looking at the content cipher, its errors cannot be used
+// to detect these cases after the fact.
+func (e *EnvelopedData) UnsupportedByPKCS7(cert *x509.Certificate) bool {
+	alg := e.ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
+	if _, ok := aesCBCByOID(alg); !ok {
+		return false // DES, 3DES, AES-GCM: only the library can open these
+	}
+	if alg.Equal(OIDAES192CBC) {
+		return true
+	}
+	recipient := e.ed.recipientFor(cert)
+	return recipient != nil && recipient.KeyEncryptionAlgorithm.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP)
+}
+
+// Decrypt opens an AES-CBC encrypted envelope addressed to cert, using its RSA
+// private key.
+func (e *EnvelopedData) Decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	recipient := e.ed.recipientFor(cert)
+	if recipient == nil {
+		return nil, errors.New("envelope: no recipient info for the certificate")
+	}
+	eci := e.ed.EncryptedContentInfo
+	alg, ok := aesCBCByOID(eci.ContentEncryptionAlgorithm.Algorithm)
+	if !ok {
+		return nil, fmt.Errorf("envelope: unsupported content encryption algorithm %s", eci.ContentEncryptionAlgorithm.Algorithm)
+	}
+
+	contentKey, err := decryptContentKey(recipient, key)
+	if err != nil {
+		return nil, err
+	}
+	if len(contentKey) != alg.keyLen {
+		return nil, errors.New("envelope: content key has the wrong length")
+	}
+
+	var iv []byte
+	if _, err := asn1.Unmarshal(eci.ContentEncryptionAlgorithm.Parameters.FullBytes, &iv); err != nil {
+		return nil, fmt.Errorf("envelope: parse IV: %w", err)
+	}
+	if len(iv) != aes.BlockSize {
+		return nil, errors.New("envelope: IV has the wrong length")
+	}
+
+	ciphertext, err := encryptedContentBytes(eci.EncryptedContent)
+	if err != nil {
+		return nil, err
+	}
+	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+		return nil, errors.New("envelope: ciphertext is not a multiple of the block size")
+	}
+
+	block, err := aes.NewCipher(contentKey)
+	if err != nil {
+		return nil, err
+	}
+	plaintext := make([]byte, len(ciphertext))
+	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, ciphertext)
+
+	return pkcs7Unpad(plaintext, aes.BlockSize)
+}
+
+// decryptContentKey unwraps the content key with RSA PKCS #1 v1.5 or RSAES-OAEP
+// (NDES answers AES-192 requests with OAEP).
+func decryptContentKey(recipient *recipientInfo, key *rsa.PrivateKey) ([]byte, error) {
+	var contentKey []byte
+	var err error
+	switch alg := recipient.KeyEncryptionAlgorithm; {
+	case alg.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSA):
+		contentKey, err = rsa.DecryptPKCS1v15(nil, key, recipient.EncryptedKey)
+	case alg.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP):
+		hash, label, perr := oaepParameters(alg.Parameters)
+		if perr != nil {
+			return nil, perr
+		}
+		contentKey, err = rsa.DecryptOAEP(hash.New(), nil, key, recipient.EncryptedKey, label)
+	default:
+		return nil, fmt.Errorf("envelope: unsupported key encryption algorithm %s", alg.Algorithm)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("envelope: decrypt content key: %w", err)
+	}
+	return contentKey, nil
+}
+
+// rsaOAEPParameters is RSAES-OAEP-params (RFC 8017, appendix A.2.1). Absent
+// fields default to SHA-1, MGF1 with SHA-1 and an empty label.
+type rsaOAEPParameters struct {
+	HashFunc    pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:0"`
+	MaskGenFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:1"`
+	PSourceFunc pkix.AlgorithmIdentifier `asn1:"optional,explicit,tag:2"`
+}
+
+func oaepParameters(raw asn1.RawValue) (crypto.Hash, []byte, error) {
+	var params rsaOAEPParameters
+	if len(raw.FullBytes) > 0 && !bytes.Equal(raw.FullBytes, asn1.NullBytes) {
+		rest, err := asn1.Unmarshal(raw.FullBytes, &params)
+		if err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse RSAES-OAEP parameters: %w", err)
+		}
+		if len(rest) != 0 {
+			return 0, nil, errors.New("envelope: trailing data after RSAES-OAEP parameters")
+		}
+	}
+
+	hash := crypto.SHA1
+	if len(params.HashFunc.Algorithm) > 0 {
+		var err error
+		if hash, err = oaepHash(params.HashFunc.Algorithm); err != nil {
+			return 0, nil, err
+		}
+	}
+
+	mgfHash := crypto.SHA1
+	if len(params.MaskGenFunc.Algorithm) > 0 {
+		if !params.MaskGenFunc.Algorithm.Equal(oidMGF1) {
+			return 0, nil, fmt.Errorf("envelope: unsupported RSAES-OAEP mask generation function %s", params.MaskGenFunc.Algorithm)
+		}
+		var mgfDigest pkix.AlgorithmIdentifier
+		if _, err := asn1.Unmarshal(params.MaskGenFunc.Parameters.FullBytes, &mgfDigest); err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse MGF1 parameters: %w", err)
+		}
+		var err error
+		if mgfHash, err = oaepHash(mgfDigest.Algorithm); err != nil {
+			return 0, nil, err
+		}
+	}
+	// rsa.DecryptOAEP uses one hash for both, as do the CMS implementations seen in practice
+	if mgfHash != hash {
+		return 0, nil, errors.New("envelope: RSAES-OAEP with different OAEP and MGF1 hashes is not supported")
+	}
+
+	var label []byte
+	if len(params.PSourceFunc.Algorithm) > 0 {
+		if !params.PSourceFunc.Algorithm.Equal(oidPSpecified) {
+			return 0, nil, fmt.Errorf("envelope: unsupported RSAES-OAEP label source %s", params.PSourceFunc.Algorithm)
+		}
+		if _, err := asn1.Unmarshal(params.PSourceFunc.Parameters.FullBytes, &label); err != nil {
+			return 0, nil, fmt.Errorf("envelope: parse RSAES-OAEP label: %w", err)
+		}
+	}
+
+	return hash, label, nil
+}
+
+func oaepHash(oid asn1.ObjectIdentifier) (crypto.Hash, error) {
+	switch {
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA1):
+		return crypto.SHA1, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA224):
+		return crypto.SHA224, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA256):
+		return crypto.SHA256, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA384):
+		return crypto.SHA384, nil
+	case oid.Equal(pkcs7.OIDDigestAlgorithmSHA512):
+		return crypto.SHA512, nil
+	}
+	return 0, fmt.Errorf("envelope: unsupported RSAES-OAEP hash %s", oid)
+}
+
+// encryptedContentBytes returns the ciphertext of an [0] IMPLICIT OCTET STRING,
+// which BER allows to be split into a constructed sequence of OCTET STRINGs.
+func encryptedContentBytes(v asn1.RawValue) ([]byte, error) {
+	if !v.IsCompound {
+		return v.Bytes, nil
+	}
+	var buf bytes.Buffer
+	rest := v.Bytes
+	for len(rest) > 0 {
+		var part []byte
+		var err error
+		if rest, err = asn1.Unmarshal(rest, &part); err != nil {
+			return nil, fmt.Errorf("envelope: parse encrypted content: %w", err)
+		}
+		buf.Write(part)
+	}
+	return buf.Bytes(), nil
+}
+
+// maxBERDepth bounds the recursion of berToDER; CMS envelopes nest far less.
+const maxBERDepth = 32
+
+var errBERTruncated = errors.New("envelope: truncated BER element")
+
+// berToDER rewrites the lengths of a BER element in the form encoding/asn1
+// requires: indefinite lengths become definite and every length is minimally
+// encoded. Constructed strings are kept as they are (encryptedContentBytes
+// joins them), which is all the EnvelopedData parsing here needs.
+func berToDER(ber []byte) ([]byte, error) {
+	der, rest, err := berElementToDER(ber, 0)
+	if err != nil {
+		return nil, err
+	}
+	if len(rest) != 0 {
+		return nil, errors.New("envelope: trailing data after BER element")
+	}
+	return der, nil
+}
+
+// berElementToDER converts the first element of b and returns the rest of b.
+func berElementToDER(b []byte, depth int) (der, rest []byte, err error) {
+	if depth > maxBERDepth {
+		return nil, nil, errors.New("envelope: BER nesting too deep")
+	}
+	if len(b) == 0 {
+		return nil, nil, errBERTruncated
+	}
+
+	// identifier octets: one, or more for high tag numbers
+	i := 1
+	if b[0]&0x1f == 0x1f {
+		for {
+			if i >= len(b) {
+				return nil, nil, errBERTruncated
+			}
+			i++
+			if b[i-1]&0x80 == 0 {
+				break
+			}
+		}
+	}
+	identifier := b[:i]
+	constructed := b[0]&0x20 != 0
+
+	if i >= len(b) {
+		return nil, nil, errBERTruncated
+	}
+	var content []byte
+	switch l := b[i]; {
+	case l == 0x80: // indefinite length: children up to the end-of-contents octets
+		if !constructed {
+			return nil, nil, errors.New("envelope: indefinite length on a primitive BER element")
+		}
+		rest = b[i+1:]
+		for {
+			if len(rest) >= 2 && rest[0] == 0 && rest[1] == 0 {
+				rest = rest[2:]
+				break
+			}
+			var child []byte
+			if child, rest, err = berElementToDER(rest, depth+1); err != nil {
+				return nil, nil, err
+			}
+			content = append(content, child...)
+		}
+	default:
+		i++
+		n := int(l)
+		if l > 0x80 {
+			numBytes := int(l & 0x7f)
+			if numBytes > 4 {
+				return nil, nil, errors.New("envelope: BER length too large")
+			}
+			if i+numBytes > len(b) {
+				return nil, nil, errBERTruncated
+			}
+			n = 0
+			for _, c := range b[i : i+numBytes] {
+				n = n<<8 | int(c)
+			}
+			i += numBytes
+		}
+		if n < 0 || n > len(b)-i {
+			return nil, nil, errBERTruncated
+		}
+		content, rest = b[i:i+n], b[i+n:]
+		if constructed {
+			var children []byte
+			for r := content; len(r) > 0; {
+				var child []byte
+				if child, r, err = berElementToDER(r, depth+1); err != nil {
+					return nil, nil, err
+				}
+				children = append(children, child...)
+			}
+			content = children
+		}
+	}
+
+	der = append(der, identifier...)
+	der = append(der, derLength(len(content))...)
+	return append(der, content...), rest, nil
+}
+
+func derLength(n int) []byte {
+	if n < 0x80 {
+		return []byte{byte(n)}
+	}
+	var be []byte
+	for ; n > 0; n >>= 8 {
+		be = append([]byte{byte(n)}, be...)
+	}
+	return append([]byte{0x80 | byte(len(be))}, be...)
+}
+
+func pkcs7Pad(data []byte, blockSize int) []byte {
+	padLen := blockSize - len(data)%blockSize
+	padded := make([]byte, len(data), len(data)+padLen)
+	copy(padded, data)
+	return append(padded, bytes.Repeat([]byte{byte(padLen)}, padLen)...)
+}
+
+func pkcs7Unpad(data []byte, blockSize int) ([]byte, error) {
+	if len(data) == 0 || len(data)%blockSize != 0 {
+		return nil, errors.New("envelope: invalid padding")
+	}
+	padLen := int(data[len(data)-1])
+	if padLen == 0 || padLen > blockSize {
+		return nil, errors.New("envelope: invalid padding")
+	}
+	for _, b := range data[len(data)-padLen:] {
+		if int(b) != padLen {
+			return nil, errors.New("envelope: invalid padding")
+		}
+	}
+	return data[:len(data)-padLen], nil
+}
