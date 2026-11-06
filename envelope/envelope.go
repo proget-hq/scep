@@ -1,4 +1,10 @@
-package main
+// Package envelope builds and opens the CMS EnvelopedData (RFC 5652, section 6)
+// of SCEP pkiMessages where the pkcs7 library cannot: it neither encrypts nor
+// decrypts AES-192, and its RSAES-OAEP key transport support is incomplete.
+// Envelopes are built with AES-CBC of any key size and opened when the content
+// key is wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is left
+// to the library; see EnvelopedData.UnsupportedByPKCS7.
+package envelope
 
 import (
 	"bytes"
@@ -17,40 +23,42 @@ import (
 	"github.com/smallstep/pkcs7"
 )
 
-// The pkcs7 library neither encrypts nor decrypts AES-192, and its RSAES-OAEP
-// key transport support is incomplete. This file builds and opens CMS
-// EnvelopedData (RFC 5652, section 6) with AES-CBC of any key size and opens
-// content keys wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is
-// left to the library.
-
 var (
-	oidAES128CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
-	oidAES192CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 22}
-	oidAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
+	OIDAES128CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 2}
+	OIDAES192CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 22}
+	OIDAES256CBC = asn1.ObjectIdentifier{2, 16, 840, 1, 101, 3, 4, 1, 42}
 
 	oidMGF1       = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 8}
 	oidPSpecified = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 9}
 )
 
-// aesCBC is an AES-CBC content encryption algorithm.
-type aesCBC struct {
+// AESCBC is an AES-CBC content encryption algorithm.
+type AESCBC struct {
 	oid    asn1.ObjectIdentifier
 	keyLen int
 }
 
-var aesCBCAlgorithms = []aesCBC{
-	{oid: oidAES128CBC, keyLen: 16},
-	{oid: oidAES192CBC, keyLen: 24},
-	{oid: oidAES256CBC, keyLen: 32},
+// The AES-CBC content encryption algorithms.
+var (
+	AES128CBC = AESCBC{oid: OIDAES128CBC, keyLen: 16}
+	AES192CBC = AESCBC{oid: OIDAES192CBC, keyLen: 24}
+	AES256CBC = AESCBC{oid: OIDAES256CBC, keyLen: 32}
+)
+
+var aesCBCAlgorithms = []AESCBC{AES128CBC, AES192CBC, AES256CBC}
+
+// OID returns the content encryption algorithm identifier.
+func (alg AESCBC) OID() asn1.ObjectIdentifier {
+	return alg.oid
 }
 
-func aesCBCByOID(oid asn1.ObjectIdentifier) (aesCBC, bool) {
+func aesCBCByOID(oid asn1.ObjectIdentifier) (AESCBC, bool) {
 	for _, alg := range aesCBCAlgorithms {
 		if alg.oid.Equal(oid) {
 			return alg, true
 		}
 	}
-	return aesCBC{}, false
+	return AESCBC{}, false
 }
 
 type contentInfo struct {
@@ -82,9 +90,9 @@ type encryptedContentInfo struct {
 	EncryptedContent           asn1.RawValue `asn1:"tag:0,optional"`
 }
 
-// encrypt wraps content in a DER encoded EnvelopedData readable by every
+// Encrypt wraps content in a DER encoded EnvelopedData readable by every
 // recipient. The content key is transported with RSA PKCS #1 v1.5, as in SCEP.
-func (alg aesCBC) encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+func (alg AESCBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 	key := make([]byte, alg.keyLen)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
@@ -151,19 +159,24 @@ func (alg aesCBC) encrypt(content []byte, recipients []*x509.Certificate) ([]byt
 	})
 }
 
-// decryptEnvelope opens a BER or DER encoded, AES-CBC encrypted EnvelopedData
+// Decrypt opens a BER or DER encoded, AES-CBC encrypted EnvelopedData
 // addressed to cert, using its RSA private key.
-func decryptEnvelope(ber []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
-	ed, err := parseEnvelope(ber)
+func Decrypt(ber []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	ed, err := Parse(ber)
 	if err != nil {
 		return nil, err
 	}
-	return ed.decrypt(cert, key)
+	return ed.Decrypt(cert, key)
 }
 
-// parseEnvelope parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
+// EnvelopedData is a parsed CMS EnvelopedData.
+type EnvelopedData struct {
+	ed envelopedData
+}
+
+// Parse parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
 // accepts BER, which CMS encoders streaming their output produce.
-func parseEnvelope(ber []byte) (*envelopedData, error) {
+func Parse(ber []byte) (*EnvelopedData, error) {
 	der, err := berToDER(ber)
 	if err != nil {
 		return nil, err
@@ -181,7 +194,12 @@ func parseEnvelope(ber []byte) (*envelopedData, error) {
 	if _, err := asn1.Unmarshal(ci.Content.Bytes, &ed); err != nil {
 		return nil, fmt.Errorf("envelope: parse enveloped data: %w", err)
 	}
-	return &ed, nil
+	return &EnvelopedData{ed: ed}, nil
+}
+
+// ContentEncryptionAlgorithm returns the identifier of the content cipher.
+func (e *EnvelopedData) ContentEncryptionAlgorithm() asn1.ObjectIdentifier {
+	return e.ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
 }
 
 // recipientFor returns the RecipientInfo addressed to cert, or nil.
@@ -195,32 +213,32 @@ func (ed *envelopedData) recipientFor(cert *x509.Certificate) *recipientInfo {
 	return nil
 }
 
-// needsOwnDecrypter reports whether the envelope addressed to cert has to be
-// opened by decrypt rather than the pkcs7 library. pkcs7 (v0.1.1) cannot
+// UnsupportedByPKCS7 reports whether the envelope addressed to cert has to be
+// opened by Decrypt rather than the pkcs7 library. pkcs7 (v0.1.1) cannot
 // decrypt AES-192, and its RSAES-OAEP support rejects absent or NULL
 // parameters and ignores the label and the MGF1 hash. Since it unwraps the
 // content key before looking at the content cipher, its errors cannot be used
 // to detect these cases after the fact.
-func (ed *envelopedData) needsOwnDecrypter(cert *x509.Certificate) bool {
-	alg := ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
+func (e *EnvelopedData) UnsupportedByPKCS7(cert *x509.Certificate) bool {
+	alg := e.ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
 	if _, ok := aesCBCByOID(alg); !ok {
 		return false // DES, 3DES, AES-GCM: only the library can open these
 	}
-	if alg.Equal(oidAES192CBC) {
+	if alg.Equal(OIDAES192CBC) {
 		return true
 	}
-	recipient := ed.recipientFor(cert)
+	recipient := e.ed.recipientFor(cert)
 	return recipient != nil && recipient.KeyEncryptionAlgorithm.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP)
 }
 
-// decrypt opens an AES-CBC encrypted envelope addressed to cert, using its RSA
+// Decrypt opens an AES-CBC encrypted envelope addressed to cert, using its RSA
 // private key.
-func (ed *envelopedData) decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
-	recipient := ed.recipientFor(cert)
+func (e *EnvelopedData) Decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	recipient := e.ed.recipientFor(cert)
 	if recipient == nil {
-		return nil, errors.New("envelope: no recipient info for the signer certificate")
+		return nil, errors.New("envelope: no recipient info for the certificate")
 	}
-	eci := ed.EncryptedContentInfo
+	eci := e.ed.EncryptedContentInfo
 	alg, ok := aesCBCByOID(eci.ContentEncryptionAlgorithm.Algorithm)
 	if !ok {
 		return nil, fmt.Errorf("envelope: unsupported content encryption algorithm %s", eci.ContentEncryptionAlgorithm.Algorithm)

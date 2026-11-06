@@ -8,12 +8,8 @@ import (
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/asn1"
-	"encoding/pem"
 	"errors"
 	"math/big"
-	"os"
-	"os/exec"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -21,6 +17,9 @@ import (
 	"github.com/go-kit/kit/log"
 	"github.com/smallstep/pkcs7"
 	"github.com/smallstep/scep"
+
+	"github.com/micromdm/scep/v2/envelope"
+	"github.com/micromdm/scep/v2/envelope/envelopetest"
 )
 
 func newTestKey(t *testing.T) *rsa.PrivateKey {
@@ -70,88 +69,6 @@ func newTestCSR(t *testing.T, key *rsa.PrivateKey) *x509.CertificateRequest {
 	return csr
 }
 
-func TestAESEnvelopeRoundTrip(t *testing.T) {
-	caCert, caKey := newTestCA(t)
-	content := []byte("a CSR, or anything else that needs padding")
-
-	for _, alg := range aesCBCAlgorithms {
-		t.Run(alg.oid.String(), func(t *testing.T) {
-			der, err := alg.encrypt(content, []*x509.Certificate{caCert})
-			if err != nil {
-				t.Fatal(err)
-			}
-
-			got, err := decryptEnvelope(der, caCert, caKey)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, content) {
-				t.Fatalf("decryptEnvelope = %q, want %q", got, content)
-			}
-
-			// cross-check against the pkcs7 library where it supports the cipher
-			if alg.oid.Equal(oidAES192CBC) {
-				return
-			}
-			p7, err := pkcs7.Parse(der)
-			if err != nil {
-				t.Fatal(err)
-			}
-			got, err = p7.Decrypt(caCert, caKey)
-			if err != nil {
-				t.Fatal(err)
-			}
-			if !bytes.Equal(got, content) {
-				t.Fatalf("pkcs7 Decrypt = %q, want %q", got, content)
-			}
-		})
-	}
-}
-
-// TestAESEnvelopeOpenSSL checks interoperability with an independent CMS
-// implementation, which matters most for AES-192.
-func TestAESEnvelopeOpenSSL(t *testing.T) {
-	if _, err := exec.LookPath("openssl"); err != nil {
-		t.Skip("openssl not installed")
-	}
-	caCert, caKey := newTestCA(t)
-	content := []byte("decrypted by openssl")
-
-	dir := t.TempDir()
-	certPath := filepath.Join(dir, "ca.pem")
-	keyPath := filepath.Join(dir, "ca.key")
-	writePEM(t, certPath, "CERTIFICATE", caCert.Raw)
-	writePEM(t, keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(caKey))
-
-	for _, alg := range aesCBCAlgorithms {
-		t.Run(alg.oid.String(), func(t *testing.T) {
-			der, err := alg.encrypt(content, []*x509.Certificate{caCert})
-			if err != nil {
-				t.Fatal(err)
-			}
-			in := filepath.Join(dir, "envelope.der")
-			if err := os.WriteFile(in, der, 0600); err != nil {
-				t.Fatal(err)
-			}
-			out, err := exec.Command("openssl", "cms", "-decrypt", "-inform", "DER", "-in", in,
-				"-recip", certPath, "-inkey", keyPath).CombinedOutput()
-			if err != nil {
-				t.Fatalf("openssl cms -decrypt: %v\n%s", err, out)
-			}
-			if !bytes.Equal(out, content) {
-				t.Fatalf("openssl decrypted %q, want %q", out, content)
-			}
-		})
-	}
-}
-
-func writePEM(t *testing.T, path, blockType string, der []byte) {
-	t.Helper()
-	if err := os.WriteFile(path, pem.EncodeToMemory(&pem.Block{Type: blockType, Bytes: der}), 0600); err != nil {
-		t.Fatal(err)
-	}
-}
-
 func TestNewCSRRequest(t *testing.T) {
 	caCert, caKey := newTestCA(t)
 	clientKey := newTestKey(t)
@@ -191,24 +108,24 @@ func TestNewCSRRequest(t *testing.T) {
 					t.Errorf("digest algorithm = %s, want %s", got, digest)
 				}
 
-				ed, err := parseEnvelope(p7.Content)
+				ed, err := envelope.Parse(p7.Content)
 				if err != nil {
 					t.Fatal(err)
 				}
-				if got := ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm; !got.Equal(encryptionOIDs[encName]) {
+				if got := ed.ContentEncryptionAlgorithm(); !got.Equal(encryptionOIDs[encName]) {
 					t.Errorf("content encryption = %s, want %s", got, encryptionOIDs[encName])
 				}
 
-				var envelope []byte
+				var content []byte
 				if encName == "aes192" {
-					envelope, err = decryptEnvelope(p7.Content, caCert, caKey)
+					content, err = envelope.Decrypt(p7.Content, caCert, caKey)
 				} else {
-					envelope, err = p7Decrypt(p7.Content, caCert, caKey)
+					content, err = p7Decrypt(p7.Content, caCert, caKey)
 				}
 				if err != nil {
 					t.Fatal(err)
 				}
-				if !bytes.Equal(envelope, csr.Raw) {
+				if !bytes.Equal(content, csr.Raw) {
 					t.Error("decrypted envelope is not the CSR")
 				}
 			})
@@ -218,9 +135,9 @@ func TestNewCSRRequest(t *testing.T) {
 
 var encryptionOIDs = map[string]asn1.ObjectIdentifier{
 	"des":    pkcs7.OIDEncryptionAlgorithmDESCBC,
-	"aes128": oidAES128CBC,
-	"aes192": oidAES192CBC,
-	"aes256": oidAES256CBC,
+	"aes128": envelope.OIDAES128CBC,
+	"aes192": envelope.OIDAES192CBC,
+	"aes256": envelope.OIDAES256CBC,
 }
 
 func p7Decrypt(der []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
@@ -245,7 +162,7 @@ func TestNewCSRRequestRejectsUnselectedRecipients(t *testing.T) {
 		Recipients:  []*x509.Certificate{caCert},
 		SignerKey:   clientKey,
 		SignerCert:  signer,
-	}, scep.FingerprintCertsSelector(fingerprintHashType, make([]byte, 32)), aesCBCAlgorithms[0].encrypt, pkcs7.OIDDigestAlgorithmSHA256, log.NewNopLogger())
+	}, scep.FingerprintCertsSelector(fingerprintHashType, make([]byte, 32)), envelope.AES128CBC.Encrypt, pkcs7.OIDDigestAlgorithmSHA256, log.NewNopLogger())
 	if err == nil {
 		t.Fatal("expected an error when the selector drops every recipient")
 	}
@@ -286,7 +203,7 @@ func newCertRep(t *testing.T, caCert *x509.Certificate, caKey *rsa.PrivateKey, e
 
 // TestDecryptCertRep checks the client gets the issued certificate out of
 // CertReps encrypted the ways SCEP servers do, whether the pkcs7 library or
-// decryptEnvelope has to open them.
+// the envelope package has to open them.
 func TestDecryptCertRep(t *testing.T) {
 	caCert, caKey := newTestCA(t)
 	clientKey := newTestKey(t)
@@ -312,7 +229,7 @@ func TestDecryptCertRep(t *testing.T) {
 
 	oaep := func(hash crypto.Hash, label []byte, params func(t *testing.T) []byte) func(t *testing.T, der []byte) []byte {
 		return func(t *testing.T, der []byte) []byte {
-			return withOAEPKeyTransport(t, der, clientKey, hash, label, params(t))
+			return envelopetest.WithOAEPKeyTransport(t, der, clientKey, hash, label, params(t))
 		}
 	}
 	for _, tc := range []struct {
@@ -327,10 +244,10 @@ func TestDecryptCertRep(t *testing.T) {
 		{name: "AES-256", encryption: "aes256"},
 		{name: "AES-192", encryption: "aes192", libraryFails: true},
 		{name: "AES-192 BER", encryption: "aes192", libraryFails: true, rewrap: func(t *testing.T, der []byte) []byte {
-			return indefiniteBER(t, der)
+			return envelopetest.IndefiniteBER(t, der)
 		}},
 		{name: "AES-256 OAEP default parameters", encryption: "aes256", rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
-			return mustMarshal(t, rsaOAEPParameters{})
+			return envelopetest.DefaultOAEPParameters(t)
 		})},
 		{name: "AES-128 OAEP absent parameters", encryption: "aes128", libraryFails: true, rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
 			return nil
@@ -339,10 +256,10 @@ func TestDecryptCertRep(t *testing.T) {
 			return asn1.NullBytes
 		})},
 		{name: "AES-256 OAEP SHA-256 with label", encryption: "aes256", libraryFails: true, rewrap: oaep(crypto.SHA256, []byte("label"), func(t *testing.T) []byte {
-			return explicitOAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, []byte("label"))
+			return envelopetest.OAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, []byte("label"))
 		})},
 		{name: "AES-192 OAEP SHA-256", encryption: "aes192", libraryFails: true, rewrap: oaep(crypto.SHA256, nil, func(t *testing.T) []byte {
-			return explicitOAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, nil)
+			return envelopetest.OAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, nil)
 		})},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -357,7 +274,7 @@ func TestDecryptCertRep(t *testing.T) {
 			// make sure the case exercises what it claims to
 			err = newCertRep(t, caCert, caKey, envelope).DecryptPKIEnvelope(signer, clientKey)
 			if tc.libraryFails && err == nil {
-				t.Fatal("pkcs7 library opened the envelope, the case does not need decryptEnvelope")
+				t.Fatal("pkcs7 library opened the envelope, the case does not need the envelope package")
 			} else if !tc.libraryFails && err != nil {
 				t.Fatalf("pkcs7 library: %v", err)
 			}
