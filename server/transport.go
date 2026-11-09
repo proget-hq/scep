@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"io/ioutil"
+	"mime"
 	"net/http"
 	"net/url"
 
@@ -147,8 +148,10 @@ func DecodeSCEPResponse(ctx context.Context, r *http.Response) (interface{}, err
 	resp := SCEPResponse{
 		Data: data,
 	}
-	header := r.Header.Get("Content-Type")
-	if header == certChainHeader {
+	// media types are case-insensitive and may carry parameters
+	// ("application/x-x509-ca-ra-cert; charset=binary")
+	mediaType, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type"))
+	if mediaType == certChainHeader {
 		// we only set it to two to indicate a cert chain.
 		// the actual number of certs will be in the payload.
 		resp.CACertNum = 2
