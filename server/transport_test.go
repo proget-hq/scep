@@ -188,3 +188,31 @@ func loadTestFile(t *testing.T, path string) []byte {
 	}
 	return data
 }
+
+func TestDecodeSCEPResponseCertChainContentType(t *testing.T) {
+	for _, tc := range []struct {
+		contentType string
+		chain       bool
+	}{
+		{"application/x-x509-ca-ra-cert", true},
+		{"application/x-x509-ca-ra-cert; charset=binary", true},
+		{"Application/X-X509-CA-RA-Cert", true},
+		{"application/x-x509-ca-cert", false},
+		{"", false},
+	} {
+		t.Run(tc.contentType, func(t *testing.T) {
+			resp := &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     http.Header{"Content-Type": []string{tc.contentType}},
+				Body:       ioutil.NopCloser(strings.NewReader("certs")),
+			}
+			decoded, err := scepserver.DecodeSCEPResponse(context.Background(), resp)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if chain := decoded.(scepserver.SCEPResponse).CACertNum > 1; chain != tc.chain {
+				t.Errorf("chain = %v, want %v", chain, tc.chain)
+			}
+		})
+	}
+}
