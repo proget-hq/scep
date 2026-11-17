@@ -290,6 +290,63 @@ func TestDecryptCertRep(t *testing.T) {
 	}
 }
 
+// TestDecryptCertRepPicksCertificateForKey checks the issued certificate is
+// found by its key when the server sends it with the chain, after the CA.
+func TestDecryptCertRepPicksCertificateForKey(t *testing.T) {
+	caCert, caKey := newTestCA(t)
+	clientKey := newTestKey(t)
+	csr := newTestCSR(t, clientKey)
+	signer, err := selfSign(clientKey, csr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	issuedDER, err := x509.CreateCertificate(rand.Reader, &x509.Certificate{
+		SerialNumber: big.NewInt(7),
+		Subject:      csr.Subject,
+		NotBefore:    time.Now().Add(-time.Minute),
+		NotAfter:     time.Now().Add(time.Hour),
+	}, caCert, &clientKey.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for _, tc := range []struct {
+		name       string
+		encryption string
+		certs      [][]byte
+		wantErr    bool
+	}{
+		{"library, CA first", "aes256", [][]byte{caCert.Raw, issuedDER}, false},
+		{"envelope package, CA first", "aes192", [][]byte{caCert.Raw, issuedDER}, false},
+		{"no certificate for the key", "aes256", [][]byte{caCert.Raw}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			degenerate, err := pkcs7.DegenerateCertificate(bytes.Join(tc.certs, nil))
+			if err != nil {
+				t.Fatal(err)
+			}
+			envelope, err := encryptionAlgorithms[tc.encryption](degenerate, []*x509.Certificate{signer})
+			if err != nil {
+				t.Fatal(err)
+			}
+
+			got, err := decryptCertRep(newCertRep(t, caCert, caKey, envelope), signer, clientKey)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatal("expected an error")
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(got.Raw, issuedDER) {
+				t.Error("decryptCertRep returned a different certificate")
+			}
+		})
+	}
+}
+
 func TestDecryptCertRepReportsLibraryAndParseErrors(t *testing.T) {
 	caCert, caKey := newTestCA(t)
 	clientKey := newTestKey(t)

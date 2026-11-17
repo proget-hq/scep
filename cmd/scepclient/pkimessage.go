@@ -114,36 +114,58 @@ func newCSRRequest(
 	return signedData.Finish()
 }
 
-// decryptCertRep returns the certificate issued in a successful CertRep. The
-// envelope is inspected first: the ones the pkcs7 library cannot open (see
+// decryptCertRep returns the certificate issued in a successful CertRep: the
+// one for key out of the certificates in the envelope, which some servers fill
+// with the chain, not always issued certificate first. The envelope is
+// inspected first: the ones the pkcs7 library cannot open (see
 // envelope.EnvelopedData.UnsupportedByPKCS7) are decrypted by the envelope
-// package, all others by DecryptPKIEnvelope.
+// package, all others by the library.
 func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) (*x509.Certificate, error) {
+	content, err := decryptCertRepEnvelope(respMsg, cert, key)
+	if err != nil {
+		return nil, err
+	}
+	certs, err := scep.CACerts(content)
+	if err != nil {
+		return nil, err
+	}
+	for _, c := range certs {
+		if pub, ok := c.PublicKey.(*rsa.PublicKey); ok && pub.Equal(&key.PublicKey) {
+			return c, nil
+		}
+	}
+	return nil, fmt.Errorf("scep: none of the %d certificates in the CertRep pkiEnvelope is for the private key", len(certs))
+}
+
+func decryptCertRepEnvelope(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
 	ed, parseErr := certRepEnvelope(respMsg)
 	if parseErr == nil && ed.UnsupportedByPKCS7(cert) {
-		content, err := ed.Decrypt(cert, key)
-		if err != nil {
-			return nil, err
-		}
-		certs, err := scep.CACerts(content)
-		if err != nil {
-			return nil, err
-		}
-		if len(certs) == 0 {
-			return nil, errors.New("scep: no certificate in the CertRep pkiEnvelope")
-		}
-		return certs[0], nil
+		return ed.Decrypt(cert, key)
 	}
 
-	// If our parser failed, the library may still read the envelope; when it
-	// cannot either, report both errors.
-	if err := respMsg.DecryptPKIEnvelope(cert, key); err != nil {
+	// What respMsg.DecryptPKIEnvelope does, which keeps only the first
+	// certificate. If our parser failed, the library may still read the
+	// envelope; when it cannot either, report both errors.
+	content, err := pkcs7Decrypt(respMsg, cert, key)
+	if err != nil {
 		if parseErr != nil {
 			return nil, fmt.Errorf("%w (%v)", err, parseErr)
 		}
 		return nil, err
 	}
-	return respMsg.CertRepMessage.Certificate, nil
+	return content, nil
+}
+
+func pkcs7Decrypt(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+	signed, err := pkcs7.Parse(respMsg.Raw)
+	if err != nil {
+		return nil, err
+	}
+	enveloped, err := pkcs7.Parse(signed.Content)
+	if err != nil {
+		return nil, err
+	}
+	return enveloped.Decrypt(cert, key)
 }
 
 // certRepEnvelope parses the EnvelopedData signed in a CertRep.
