@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/pem"
+	"math/bits"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -95,6 +96,90 @@ func TestAESEnvelopeOpenSSL(t *testing.T) {
 				t.Fatalf("openssl decrypted %q, want %q", out, content)
 			}
 		})
+	}
+}
+
+// TestDESEDE3Envelope checks the envelope against the pkcs7 library, which
+// opens DES-EDE3 for the SCEP server, and against openssl.
+func TestDESEDE3Envelope(t *testing.T) {
+	caCert, caKey := envelopetest.NewRecipient(t)
+	content := []byte("a CSR, or anything else that needs padding")
+
+	der, err := DESEDE3CBC.Encrypt(content, []*x509.Certificate{caCert})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	ed, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ed.ContentEncryptionAlgorithm(); !got.Equal(pkcs7.OIDEncryptionAlgorithmDESEDE3CBC) {
+		t.Errorf("content encryption = %s, want %s", got, pkcs7.OIDEncryptionAlgorithmDESEDE3CBC)
+	}
+	contentKey, err := decryptContentKey(ed.ed.recipientFor(caCert), caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contentKey) != 24 {
+		t.Fatalf("content key length = %d, want 24", len(contentKey))
+	}
+	for i, b := range contentKey {
+		if bits.OnesCount8(b)%2 != 1 {
+			t.Errorf("content key byte %d = %08b, want odd parity", i, b)
+		}
+	}
+
+	p7, err := pkcs7.Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := p7.Decrypt(caCert, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("pkcs7 Decrypt = %q, want %q", got, content)
+	}
+
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl not installed")
+	}
+	dir := t.TempDir()
+	certPath := filepath.Join(dir, "ca.pem")
+	keyPath := filepath.Join(dir, "ca.key")
+	in := filepath.Join(dir, "envelope.der")
+	writePEM(t, certPath, "CERTIFICATE", caCert.Raw)
+	writePEM(t, keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(caKey))
+	if err := os.WriteFile(in, der, 0600); err != nil {
+		t.Fatal(err)
+	}
+	out, err := exec.Command("openssl", "cms", "-decrypt", "-inform", "DER", "-in", in,
+		"-recip", certPath, "-inkey", keyPath).CombinedOutput()
+	if err != nil {
+		t.Fatalf("openssl cms -decrypt: %v\n%s", err, out)
+	}
+	if !bytes.Equal(out, content) {
+		t.Fatalf("openssl decrypted %q, want %q", out, content)
+	}
+}
+
+func TestSetDESParity(t *testing.T) {
+	for in, want := range map[byte]byte{
+		0x00: 0x01,
+		0x01: 0x01,
+		0xfe: 0xfe,
+		0xff: 0xfe,
+		0x80: 0x80,
+		0x81: 0x80,
+		0x02: 0x02,
+		0x03: 0x02,
+	} {
+		key := []byte{in}
+		setDESParity(key)
+		if key[0] != want {
+			t.Errorf("setDESParity(%08b) = %08b, want %08b", in, key[0], want)
+		}
 	}
 }
 
@@ -216,7 +301,7 @@ func TestUnsupportedByPKCS7(t *testing.T) {
 	otherCert.SerialNumber.SetInt64(43)
 	content := []byte("content")
 
-	encrypt := func(t *testing.T, alg AESCBC) []byte {
+	encrypt := func(t *testing.T, alg CBC) []byte {
 		der, err := alg.Encrypt(content, []*x509.Certificate{caCert})
 		if err != nil {
 			t.Fatal(err)
@@ -243,6 +328,7 @@ func TestUnsupportedByPKCS7(t *testing.T) {
 		want     bool
 	}{
 		{"DES", des, caCert, false},
+		{"DES-EDE3", func(t *testing.T) []byte { return encrypt(t, DESEDE3CBC) }, caCert, false},
 		{"AES-128", func(t *testing.T) []byte { return encrypt(t, AES128CBC) }, caCert, false},
 		{"AES-256", func(t *testing.T) []byte { return encrypt(t, AES256CBC) }, caCert, false},
 		{"AES-192", func(t *testing.T) []byte { return encrypt(t, AES192CBC) }, caCert, true},

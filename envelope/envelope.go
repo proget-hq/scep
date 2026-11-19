@@ -1,9 +1,10 @@
 // Package envelope builds and opens the CMS EnvelopedData (RFC 5652, section 6)
 // of SCEP pkiMessages where the pkcs7 library cannot: it neither encrypts nor
-// decrypts AES-192, and its RSAES-OAEP key transport support is incomplete.
-// Envelopes are built with AES-CBC of any key size and opened when the content
-// key is wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is left
-// to the library; see EnvelopedData.UnsupportedByPKCS7.
+// decrypts AES-192, it does not encrypt DES-EDE3, and its RSAES-OAEP key
+// transport support is incomplete. Envelopes are built with AES-CBC of any key
+// size or DES-EDE3-CBC, and AES-CBC ones are opened when the content key is
+// wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is left to the
+// library; see EnvelopedData.UnsupportedByPKCS7.
 package envelope
 
 import (
@@ -11,6 +12,7 @@ import (
 	"crypto"
 	"crypto/aes"
 	"crypto/cipher"
+	"crypto/des"
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/x509"
@@ -19,6 +21,7 @@ import (
 	"errors"
 	"fmt"
 	"math/big"
+	"math/bits"
 
 	"github.com/smallstep/pkcs7"
 )
@@ -32,33 +35,53 @@ var (
 	oidPSpecified = asn1.ObjectIdentifier{1, 2, 840, 113549, 1, 1, 9}
 )
 
-// AESCBC is an AES-CBC content encryption algorithm.
-type AESCBC struct {
-	oid    asn1.ObjectIdentifier
-	keyLen int
+// CBC is a CBC mode content encryption algorithm.
+type CBC struct {
+	oid      asn1.ObjectIdentifier
+	keyLen   int
+	newBlock func(key []byte) (cipher.Block, error)
+	// newKey adjusts a random content key, if the cipher needs it
+	newKey func(key []byte)
 }
 
-// The AES-CBC content encryption algorithms.
+// The CBC content encryption algorithms.
 var (
-	AES128CBC = AESCBC{oid: OIDAES128CBC, keyLen: 16}
-	AES192CBC = AESCBC{oid: OIDAES192CBC, keyLen: 24}
-	AES256CBC = AESCBC{oid: OIDAES256CBC, keyLen: 32}
+	AES128CBC = CBC{oid: OIDAES128CBC, keyLen: 16, newBlock: aes.NewCipher}
+	AES192CBC = CBC{oid: OIDAES192CBC, keyLen: 24, newBlock: aes.NewCipher}
+	AES256CBC = CBC{oid: OIDAES256CBC, keyLen: 32, newBlock: aes.NewCipher}
+	// DESEDE3CBC (RFC 3370, section 5.1) is only encrypted here: the pkcs7
+	// library opens it.
+	DESEDE3CBC = CBC{oid: pkcs7.OIDEncryptionAlgorithmDESEDE3CBC, keyLen: 24, newBlock: des.NewTripleDESCipher, newKey: setDESParity}
 )
 
-var aesCBCAlgorithms = []AESCBC{AES128CBC, AES192CBC, AES256CBC}
+// aesCBCAlgorithms are the algorithms Decrypt opens.
+var aesCBCAlgorithms = []CBC{AES128CBC, AES192CBC, AES256CBC}
 
 // OID returns the content encryption algorithm identifier.
-func (alg AESCBC) OID() asn1.ObjectIdentifier {
+func (alg CBC) OID() asn1.ObjectIdentifier {
 	return alg.oid
 }
 
-func aesCBCByOID(oid asn1.ObjectIdentifier) (AESCBC, bool) {
+func aesCBCByOID(oid asn1.ObjectIdentifier) (CBC, bool) {
 	for _, alg := range aesCBCAlgorithms {
 		if alg.oid.Equal(oid) {
 			return alg, true
 		}
 	}
-	return AESCBC{}, false
+	return CBC{}, false
+}
+
+// setDESParity gives every byte of a DES key odd parity, as OpenSSL does for
+// the keys it generates. Go ignores the parity bits, other implementations
+// may not.
+func setDESParity(key []byte) {
+	for i, b := range key {
+		b &^= 1
+		if bits.OnesCount8(b)%2 == 0 {
+			b |= 1
+		}
+		key[i] = b
+	}
 }
 
 type contentInfo struct {
@@ -92,20 +115,23 @@ type encryptedContentInfo struct {
 
 // Encrypt wraps content in a DER encoded EnvelopedData readable by every
 // recipient. The content key is transported with RSA PKCS #1 v1.5, as in SCEP.
-func (alg AESCBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+func (alg CBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
 	key := make([]byte, alg.keyLen)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
 	}
-	iv := make([]byte, aes.BlockSize)
-	if _, err := rand.Read(iv); err != nil {
-		return nil, err
+	if alg.newKey != nil {
+		alg.newKey(key)
 	}
-	block, err := aes.NewCipher(key)
+	block, err := alg.newBlock(key)
 	if err != nil {
 		return nil, err
 	}
-	ciphertext := pkcs7Pad(content, aes.BlockSize)
+	iv := make([]byte, block.BlockSize())
+	if _, err := rand.Read(iv); err != nil {
+		return nil, err
+	}
+	ciphertext := pkcs7Pad(content, block.BlockSize())
 	cipher.NewCBCEncrypter(block, iv).CryptBlocks(ciphertext, ciphertext)
 
 	ivParam, err := asn1.Marshal(iv)
@@ -256,7 +282,11 @@ func (e *EnvelopedData) Decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]
 	if _, err := asn1.Unmarshal(eci.ContentEncryptionAlgorithm.Parameters.FullBytes, &iv); err != nil {
 		return nil, fmt.Errorf("envelope: parse IV: %w", err)
 	}
-	if len(iv) != aes.BlockSize {
+	block, err := alg.newBlock(contentKey)
+	if err != nil {
+		return nil, err
+	}
+	if len(iv) != block.BlockSize() {
 		return nil, errors.New("envelope: IV has the wrong length")
 	}
 
@@ -264,18 +294,14 @@ func (e *EnvelopedData) Decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]
 	if err != nil {
 		return nil, err
 	}
-	if len(ciphertext) == 0 || len(ciphertext)%aes.BlockSize != 0 {
+	if len(ciphertext) == 0 || len(ciphertext)%block.BlockSize() != 0 {
 		return nil, errors.New("envelope: ciphertext is not a multiple of the block size")
 	}
 
-	block, err := aes.NewCipher(contentKey)
-	if err != nil {
-		return nil, err
-	}
 	plaintext := make([]byte, len(ciphertext))
 	cipher.NewCBCDecrypter(block, iv).CryptBlocks(plaintext, ciphertext)
 
-	return pkcs7Unpad(plaintext, aes.BlockSize)
+	return pkcs7Unpad(plaintext, block.BlockSize())
 }
 
 // decryptContentKey unwraps the content key with RSA PKCS #1 v1.5 or RSAES-OAEP

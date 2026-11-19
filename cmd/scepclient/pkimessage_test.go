@@ -135,6 +135,7 @@ func TestNewCSRRequest(t *testing.T) {
 
 var encryptionOIDs = map[string]asn1.ObjectIdentifier{
 	"des":    pkcs7.OIDEncryptionAlgorithmDESCBC,
+	"des3":   pkcs7.OIDEncryptionAlgorithmDESEDE3CBC,
 	"aes128": envelope.OIDAES128CBC,
 	"aes192": envelope.OIDAES192CBC,
 	"aes256": envelope.OIDAES256CBC,
