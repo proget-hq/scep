@@ -112,7 +112,7 @@ func TestPKIOperationEnvelopes(t *testing.T) {
 			return der
 		}
 	}
-	aesEncrypt := func(alg envelope.AESCBC, rewrap func(t *testing.T, der []byte) []byte) func(t *testing.T, content []byte) []byte {
+	cbcEncrypt := func(alg envelope.CBC, rewrap func(t *testing.T, der []byte) []byte) func(t *testing.T, content []byte) []byte {
 		return func(t *testing.T, content []byte) []byte {
 			der, err := alg.Encrypt(content, []*x509.Certificate{caCert})
 			if err != nil {
@@ -136,12 +136,13 @@ func TestPKIOperationEnvelopes(t *testing.T) {
 		encrypt func(t *testing.T, content []byte) []byte
 	}{
 		{"DES", pkcs7Encrypt(pkcs7.EncryptionAlgorithmDESCBC)},
+		{"DES-EDE3", cbcEncrypt(envelope.DESEDE3CBC, nil)},
 		{"AES-128", pkcs7Encrypt(pkcs7.EncryptionAlgorithmAES128CBC)},
 		{"AES-256", pkcs7Encrypt(pkcs7.EncryptionAlgorithmAES256CBC)},
-		{"AES-192", aesEncrypt(envelope.AES192CBC, nil)},
-		{"AES-192 BER", aesEncrypt(envelope.AES192CBC, ber)},
-		{"AES-192 OAEP", aesEncrypt(envelope.AES192CBC, oaep(crypto.SHA1, func(t *testing.T) []byte { return envelopetest.DefaultOAEPParameters(t) }))},
-		{"AES-256 OAEP SHA-256", aesEncrypt(envelope.AES256CBC, oaep(crypto.SHA256, func(t *testing.T) []byte {
+		{"AES-192", cbcEncrypt(envelope.AES192CBC, nil)},
+		{"AES-192 BER", cbcEncrypt(envelope.AES192CBC, ber)},
+		{"AES-192 OAEP", cbcEncrypt(envelope.AES192CBC, oaep(crypto.SHA1, func(t *testing.T) []byte { return envelopetest.DefaultOAEPParameters(t) }))},
+		{"AES-256 OAEP SHA-256", cbcEncrypt(envelope.AES256CBC, oaep(crypto.SHA256, func(t *testing.T) []byte {
 			return envelopetest.OAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, nil)
 		}))},
 	} {
