@@ -116,27 +116,22 @@ func newCSRRequest(
 	return signedData.Finish()
 }
 
-// decryptCertRep returns the certificate issued in a successful CertRep: the
-// one for key out of the certificates in the envelope, which some servers fill
-// with the chain, not always issued certificate first. The envelope is
-// inspected first: the ones the pkcs7 library cannot open (see
-// envelope.EnvelopedData.UnsupportedByPKCS7) are decrypted by the envelope
-// package, all others by the library.
-func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) (*x509.Certificate, error) {
+// decryptCertRep returns the DER certificate issued in a successful CertRep:
+// the one for key out of the certificates in the envelope, which some servers
+// fill with the chain, not always issued certificate first. The certificates
+// are not validated (see parseCSR). The envelope is inspected first: the ones
+// the pkcs7 library cannot open (see envelope.EnvelopedData.UnsupportedByPKCS7)
+// are decrypted by the envelope package, all others by the library.
+func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
 	content, err := decryptCertRepEnvelope(respMsg, cert, key)
 	if err != nil {
 		return nil, err
 	}
-	certs, err := scep.CACerts(content)
+	certs, err := degenerateCertificates(content)
 	if err != nil {
 		return nil, err
 	}
-	for _, c := range certs {
-		if pub, ok := c.PublicKey.(*rsa.PublicKey); ok && pub.Equal(&key.PublicKey) {
-			return c, nil
-		}
-	}
-	return nil, fmt.Errorf("scep: none of the %d certificates in the CertRep pkiEnvelope is for the private key", len(certs))
+	return certificateForKey(certs, key)
 }
 
 func decryptCertRepEnvelope(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
