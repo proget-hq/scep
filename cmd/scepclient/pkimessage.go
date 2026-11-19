@@ -29,9 +29,11 @@ var (
 type envelopeEncrypter func(content []byte, recipients []*x509.Certificate) ([]byte, error)
 
 // encryptionAlgorithms maps -encryption-algorithm values to encrypters.
-// "des" keeps the upstream behaviour. Only AES-192 needs our own encrypter.
+// "des" keeps the upstream behaviour. The pkcs7 library encrypts neither
+// DES-EDE3 nor AES-192, so the envelope package does.
 var encryptionAlgorithms = map[string]envelopeEncrypter{
 	"des":    pkcs7Encrypter(pkcs7.EncryptionAlgorithmDESCBC),
+	"des3":   envelope.DESEDE3CBC.Encrypt,
 	"aes128": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES128CBC),
 	"aes192": envelope.AES192CBC.Encrypt,
 	"aes256": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES256CBC),
