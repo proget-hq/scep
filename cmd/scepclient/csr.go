@@ -108,5 +108,5 @@ func loadCSRfromFile(path string) (*x509.CertificateRequest, error) {
 	if pemBlock.Type != csrPEMBlockType || len(pemBlock.Headers) != 0 {
 		return nil, errors.New("unmatched type or headers")
 	}
-	return x509.ParseCertificateRequest(pemBlock.Bytes)
+	return parseCSR(pemBlock.Bytes)
 }
