@@ -177,7 +177,7 @@ type EnvelopedData struct {
 // Parse parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
 // accepts BER, which CMS encoders streaming their output produce.
 func Parse(ber []byte) (*EnvelopedData, error) {
-	der, err := berToDER(ber)
+	der, err := BERToDER(ber)
 	if err != nil {
 		return nil, err
 	}
@@ -396,16 +396,17 @@ func encryptedContentBytes(v asn1.RawValue) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// maxBERDepth bounds the recursion of berToDER; CMS envelopes nest far less.
+// maxBERDepth bounds the recursion of BERToDER; CMS envelopes nest far less.
 const maxBERDepth = 32
 
 var errBERTruncated = errors.New("envelope: truncated BER element")
 
-// berToDER rewrites the lengths of a BER element in the form encoding/asn1
+// BERToDER rewrites the lengths of a BER element in the form encoding/asn1
 // requires: indefinite lengths become definite and every length is minimally
 // encoded. Constructed strings are kept as they are (encryptedContentBytes
-// joins them), which is all the EnvelopedData parsing here needs.
-func berToDER(ber []byte) ([]byte, error) {
+// joins them), which is all the EnvelopedData parsing here and the reading of
+// the certificates of a degenerate SignedData need.
+func BERToDER(ber []byte) ([]byte, error) {
 	der, rest, err := berElementToDER(ber, 0)
 	if err != nil {
 		return nil, err
