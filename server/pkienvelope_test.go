@@ -137,6 +137,7 @@ func TestPKIOperationEnvelopes(t *testing.T) {
 	}{
 		{"DES", pkcs7Encrypt(pkcs7.EncryptionAlgorithmDESCBC)},
 		{"DES-EDE3", cbcEncrypt(envelope.DESEDE3CBC, nil)},
+		{"DES-EDE3 OAEP NULL parameters", cbcEncrypt(envelope.DESEDE3CBC, oaep(crypto.SHA1, func(t *testing.T) []byte { return asn1.NullBytes }))},
 		{"AES-128", pkcs7Encrypt(pkcs7.EncryptionAlgorithmAES128CBC)},
 		{"AES-256", pkcs7Encrypt(pkcs7.EncryptionAlgorithmAES256CBC)},
 		{"AES-192", cbcEncrypt(envelope.AES192CBC, nil)},
