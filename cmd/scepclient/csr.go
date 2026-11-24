@@ -52,6 +52,9 @@ func loadOrMakeCSR(path string, opts *csrOptions) (*x509.CertificateRequest, err
 	}
 
 	derBytes, err := x509util.CreateCertificateRequest(rand.Reader, &template, opts.key)
+	if err != nil {
+		return nil, err
+	}
 	pemBlock := &pem.Block{
 		Type:  csrPEMBlockType,
 		Bytes: derBytes,
@@ -59,7 +62,7 @@ func loadOrMakeCSR(path string, opts *csrOptions) (*x509.CertificateRequest, err
 	if err := pem.Encode(file, pemBlock); err != nil {
 		return nil, err
 	}
-	return x509.ParseCertificateRequest(derBytes)
+	return x509util.ParseCertificateRequest(derBytes)
 }
 
 // returns nil or []string{input} to populate pkix.Name.Subject
@@ -93,5 +96,5 @@ func loadCSRfromFile(path string) (*x509.CertificateRequest, error) {
 	if pemBlock.Type != csrPEMBlockType || len(pemBlock.Headers) != 0 {
 		return nil, errors.New("unmatched type or headers")
 	}
-	return parseCSR(pemBlock.Bytes)
+	return x509util.ParseCertificateRequest(pemBlock.Bytes)
 }

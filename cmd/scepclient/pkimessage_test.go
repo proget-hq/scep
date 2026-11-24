@@ -283,7 +283,7 @@ func TestDecryptCertRep(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(got, issuedDER) {
+			if !bytes.Equal(got.Raw, issuedDER) {
 				t.Error("decryptCertRep returned a different certificate")
 			}
 		})
@@ -340,7 +340,7 @@ func TestDecryptCertRepPicksCertificateForKey(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if !bytes.Equal(got, issuedDER) {
+			if !bytes.Equal(got.Raw, issuedDER) {
 				t.Error("decryptCertRep returned a different certificate")
 			}
 		})

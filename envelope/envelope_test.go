@@ -283,10 +283,10 @@ func TestBERToDER(t *testing.T) {
 		{name: "too deep", ber: bytes.Repeat([]byte{0x30, 0x80}, maxBERDepth+2), wantErr: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := BERToDER(tc.ber)
+			got, err := berToDER(tc.ber)
 			if tc.wantErr {
 				if err == nil {
-					t.Fatalf("BERToDER = %x, want an error", got)
+					t.Fatalf("berToDER = %x, want an error", got)
 				}
 				return
 			}
@@ -294,7 +294,7 @@ func TestBERToDER(t *testing.T) {
 				t.Fatal(err)
 			}
 			if !bytes.Equal(got, tc.want) {
-				t.Errorf("BERToDER = %x, want %x", got, tc.want)
+				t.Errorf("berToDER = %x, want %x", got, tc.want)
 			}
 		})
 	}

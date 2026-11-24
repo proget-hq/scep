@@ -15,6 +15,7 @@ import (
 	"github.com/smallstep/scep"
 
 	"github.com/micromdm/scep/v2/cryptoutil"
+	"github.com/micromdm/scep/v2/cryptoutil/x509util"
 	"github.com/micromdm/scep/v2/envelope"
 )
 
@@ -114,22 +115,48 @@ func newCSRRequest(
 	return signedData.Finish()
 }
 
-// decryptCertRep returns the DER certificate issued in a successful CertRep:
-// the one for key out of the certificates in the envelope, which some servers
-// fill with the chain, not always issued certificate first. The certificates
-// are not validated (see parseCSR). The envelope is inspected first: the ones
-// the pkcs7 library cannot open (see envelope.EnvelopedData.UnsupportedByPKCS7)
-// are decrypted by the envelope package, all others by the library.
-func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
+// decryptCertRep returns the certificate issued in a successful CertRep: the
+// one for key out of the certificates in the envelope, which some servers fill
+// with the chain, not always issued certificate first. The certificates are
+// read with x509util.ParseCertificate, so one crypto/x509 refuses for its
+// extensions (say, a subjectAltName that is not ASCII) is returned as well.
+// The envelope is inspected first: the ones the pkcs7 library cannot open (see
+// envelope.EnvelopedData.UnsupportedByPKCS7) are decrypted by the envelope
+// package, all others by the library.
+func decryptCertRep(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) (*x509.Certificate, error) {
 	content, err := decryptCertRepEnvelope(respMsg, cert, key)
 	if err != nil {
 		return nil, err
 	}
-	certs, err := degenerateCertificates(content)
+	certs, err := envelope.DegenerateCertificates(content)
 	if err != nil {
 		return nil, err
 	}
 	return certificateForKey(certs, key)
+}
+
+// certificateForKey returns the certificate for key out of the DER certs. One
+// that cannot be parsed is not for key; the first such error is reported when
+// none is.
+func certificateForKey(certs [][]byte, key *rsa.PrivateKey) (*x509.Certificate, error) {
+	var parseErr error
+	for _, der := range certs {
+		c, err := x509util.ParseCertificate(der)
+		if err != nil {
+			if parseErr == nil {
+				parseErr = err
+			}
+			continue
+		}
+		if pub, ok := c.PublicKey.(*rsa.PublicKey); ok && pub.Equal(&key.PublicKey) {
+			return c, nil
+		}
+	}
+	err := fmt.Errorf("scep: none of the %d certificates in the CertRep pkiEnvelope is for the private key", len(certs))
+	if parseErr != nil {
+		err = fmt.Errorf("%w (%v)", err, parseErr)
+	}
+	return nil, err
 }
 
 func decryptCertRepEnvelope(respMsg *scep.PKIMessage, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
