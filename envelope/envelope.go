@@ -4,7 +4,8 @@
 // transport support is incomplete. Envelopes are built and opened with AES-CBC
 // of any key size or DES-EDE3-CBC, the content key wrapped with RSA PKCS #1
 // v1.5 or, when opening, RSAES-OAEP. Everything else is left to the library;
-// see EnvelopedData.UnsupportedByPKCS7.
+// see EnvelopedData.UnsupportedByPKCS7. The certificates of the degenerate
+// SignedData a CertRep envelope holds are read too, see DegenerateCertificates.
 package envelope
 
 import (
@@ -210,7 +211,21 @@ type EnvelopedData struct {
 // Parse parses a ContentInfo holding EnvelopedData. Like pkcs7.Parse it
 // accepts BER, which CMS encoders streaming their output produce.
 func Parse(ber []byte) (*EnvelopedData, error) {
-	der, err := BERToDER(ber)
+	content, err := parseContentInfo(ber, pkcs7.OIDEnvelopedData)
+	if err != nil {
+		return nil, err
+	}
+	var ed envelopedData
+	if _, err := asn1.Unmarshal(content, &ed); err != nil {
+		return nil, fmt.Errorf("envelope: parse enveloped data: %w", err)
+	}
+	return &EnvelopedData{ed: ed}, nil
+}
+
+// parseContentInfo parses a BER or DER ContentInfo of the content type want
+// and returns its content, DER encoded.
+func parseContentInfo(ber []byte, want asn1.ObjectIdentifier) ([]byte, error) {
+	der, err := berToDER(ber)
 	if err != nil {
 		return nil, err
 	}
@@ -220,14 +235,10 @@ func Parse(ber []byte) (*EnvelopedData, error) {
 	} else if len(rest) != 0 {
 		return nil, errors.New("envelope: trailing data after content info")
 	}
-	if !ci.ContentType.Equal(pkcs7.OIDEnvelopedData) {
+	if !ci.ContentType.Equal(want) {
 		return nil, fmt.Errorf("envelope: unexpected content type %s", ci.ContentType)
 	}
-	var ed envelopedData
-	if _, err := asn1.Unmarshal(ci.Content.Bytes, &ed); err != nil {
-		return nil, fmt.Errorf("envelope: parse enveloped data: %w", err)
-	}
-	return &EnvelopedData{ed: ed}, nil
+	return ci.Content.Bytes, nil
 }
 
 // ContentEncryptionAlgorithm returns the identifier of the content cipher.
@@ -429,17 +440,17 @@ func encryptedContentBytes(v asn1.RawValue) ([]byte, error) {
 	return buf.Bytes(), nil
 }
 
-// maxBERDepth bounds the recursion of BERToDER; CMS envelopes nest far less.
+// maxBERDepth bounds the recursion of berToDER; CMS envelopes nest far less.
 const maxBERDepth = 32
 
 var errBERTruncated = errors.New("envelope: truncated BER element")
 
-// BERToDER rewrites the lengths of a BER element in the form encoding/asn1
+// berToDER rewrites the lengths of a BER element in the form encoding/asn1
 // requires: indefinite lengths become definite and every length is minimally
 // encoded. Constructed strings are kept as they are (encryptedContentBytes
-// joins them), which is all the EnvelopedData parsing here and the reading of
-// the certificates of a degenerate SignedData need.
-func BERToDER(ber []byte) ([]byte, error) {
+// joins them), which is all the EnvelopedData and SignedData parsing here
+// needs.
+func berToDER(ber []byte) ([]byte, error) {
 	der, rest, err := berElementToDER(ber, 0)
 	if err != nil {
 		return nil, err

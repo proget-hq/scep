@@ -209,7 +209,7 @@ func run(cfg runCfg) error {
 		return errors.Wrapf(err, "decrypt pkiEnvelope, msgType: %s, status %s", msgType, respMsg.PKIStatus)
 	}
 
-	if err := ioutil.WriteFile(cfg.certPath, pemCert(respCert), 0666); err != nil {
+	if err := ioutil.WriteFile(cfg.certPath, pemCert(respCert.Raw), 0666); err != nil {
 		return err
 	}
 
