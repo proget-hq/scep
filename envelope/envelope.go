@@ -1,10 +1,10 @@
 // Package envelope builds and opens the CMS EnvelopedData (RFC 5652, section 6)
 // of SCEP pkiMessages where the pkcs7 library cannot: it neither encrypts nor
 // decrypts AES-192, it does not encrypt DES-EDE3, and its RSAES-OAEP key
-// transport support is incomplete. Envelopes are built with AES-CBC of any key
-// size or DES-EDE3-CBC, and AES-CBC ones are opened when the content key is
-// wrapped with RSA PKCS #1 v1.5 or RSAES-OAEP. Everything else is left to the
-// library; see EnvelopedData.UnsupportedByPKCS7.
+// transport support is incomplete. Envelopes are built and opened with AES-CBC
+// of any key size or DES-EDE3-CBC, the content key wrapped with RSA PKCS #1
+// v1.5 or, when opening, RSAES-OAEP. Everything else is left to the library;
+// see EnvelopedData.UnsupportedByPKCS7.
 package envelope
 
 import (
@@ -44,26 +44,30 @@ type CBC struct {
 	newKey func(key []byte)
 }
 
+// AESCBC is the name CBC had when it only covered AES.
+//
+// Deprecated: use CBC.
+type AESCBC = CBC
+
 // The CBC content encryption algorithms.
 var (
 	AES128CBC = CBC{oid: OIDAES128CBC, keyLen: 16, newBlock: aes.NewCipher}
 	AES192CBC = CBC{oid: OIDAES192CBC, keyLen: 24, newBlock: aes.NewCipher}
 	AES256CBC = CBC{oid: OIDAES256CBC, keyLen: 32, newBlock: aes.NewCipher}
-	// DESEDE3CBC (RFC 3370, section 5.1) is only encrypted here: the pkcs7
-	// library opens it.
+	// DESEDE3CBC is DES-EDE3-CBC (RFC 3370, section 5.1).
 	DESEDE3CBC = CBC{oid: pkcs7.OIDEncryptionAlgorithmDESEDE3CBC, keyLen: 24, newBlock: des.NewTripleDESCipher, newKey: setDESParity}
 )
 
-// aesCBCAlgorithms are the algorithms Decrypt opens.
-var aesCBCAlgorithms = []CBC{AES128CBC, AES192CBC, AES256CBC}
+// cbcAlgorithms are the algorithms Decrypt opens.
+var cbcAlgorithms = []CBC{AES128CBC, AES192CBC, AES256CBC, DESEDE3CBC}
 
 // OID returns the content encryption algorithm identifier.
 func (alg CBC) OID() asn1.ObjectIdentifier {
 	return alg.oid
 }
 
-func aesCBCByOID(oid asn1.ObjectIdentifier) (CBC, bool) {
-	for _, alg := range aesCBCAlgorithms {
+func cbcByOID(oid asn1.ObjectIdentifier) (CBC, bool) {
+	for _, alg := range cbcAlgorithms {
 		if alg.oid.Equal(oid) {
 			return alg, true
 		}
@@ -116,6 +120,9 @@ type encryptedContentInfo struct {
 // Encrypt wraps content in a DER encoded EnvelopedData readable by every
 // recipient. The content key is transported with RSA PKCS #1 v1.5, as in SCEP.
 func (alg CBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+	if alg.newBlock == nil {
+		return nil, errors.New("envelope: no content encryption algorithm, use one of the CBC variables")
+	}
 	key := make([]byte, alg.keyLen)
 	if _, err := rand.Read(key); err != nil {
 		return nil, err
@@ -185,8 +192,8 @@ func (alg CBC) Encrypt(content []byte, recipients []*x509.Certificate) ([]byte, 
 	})
 }
 
-// Decrypt opens a BER or DER encoded, AES-CBC encrypted EnvelopedData
-// addressed to cert, using its RSA private key.
+// Decrypt opens a BER or DER encoded, AES-CBC or DES-EDE3-CBC encrypted
+// EnvelopedData addressed to cert, using its RSA private key.
 func Decrypt(ber []byte, cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
 	ed, err := Parse(ber)
 	if err != nil {
@@ -247,8 +254,8 @@ func (ed *envelopedData) recipientFor(cert *x509.Certificate) *recipientInfo {
 // to detect these cases after the fact.
 func (e *EnvelopedData) UnsupportedByPKCS7(cert *x509.Certificate) bool {
 	alg := e.ed.EncryptedContentInfo.ContentEncryptionAlgorithm.Algorithm
-	if _, ok := aesCBCByOID(alg); !ok {
-		return false // DES, 3DES, AES-GCM: only the library can open these
+	if _, ok := cbcByOID(alg); !ok {
+		return false // DES, AES-GCM: only the library can open these
 	}
 	if alg.Equal(OIDAES192CBC) {
 		return true
@@ -257,15 +264,15 @@ func (e *EnvelopedData) UnsupportedByPKCS7(cert *x509.Certificate) bool {
 	return recipient != nil && recipient.KeyEncryptionAlgorithm.Algorithm.Equal(pkcs7.OIDEncryptionAlgorithmRSAESOAEP)
 }
 
-// Decrypt opens an AES-CBC encrypted envelope addressed to cert, using its RSA
-// private key.
+// Decrypt opens an AES-CBC or DES-EDE3-CBC encrypted envelope addressed to
+// cert, using its RSA private key.
 func (e *EnvelopedData) Decrypt(cert *x509.Certificate, key *rsa.PrivateKey) ([]byte, error) {
 	recipient := e.ed.recipientFor(cert)
 	if recipient == nil {
 		return nil, errors.New("envelope: no recipient info for the certificate")
 	}
 	eci := e.ed.EncryptedContentInfo
-	alg, ok := aesCBCByOID(eci.ContentEncryptionAlgorithm.Algorithm)
+	alg, ok := cbcByOID(eci.ContentEncryptionAlgorithm.Algorithm)
 	if !ok {
 		return nil, fmt.Errorf("envelope: unsupported content encryption algorithm %s", eci.ContentEncryptionAlgorithm.Algorithm)
 	}
