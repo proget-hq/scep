@@ -6,6 +6,7 @@ import (
 	"crypto/x509"
 	"encoding/asn1"
 	"encoding/pem"
+	"math/bits"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,11 +24,11 @@ func writePEM(t *testing.T, path, blockType string, der []byte) {
 	}
 }
 
-func TestAESEnvelopeRoundTrip(t *testing.T) {
+func TestCBCEnvelopeRoundTrip(t *testing.T) {
 	caCert, caKey := envelopetest.NewRecipient(t)
 	content := []byte("a CSR, or anything else that needs padding")
 
-	for _, alg := range aesCBCAlgorithms {
+	for _, alg := range cbcAlgorithms {
 		t.Run(alg.oid.String(), func(t *testing.T) {
 			der, err := alg.Encrypt(content, []*x509.Certificate{caCert})
 			if err != nil {
@@ -61,9 +62,9 @@ func TestAESEnvelopeRoundTrip(t *testing.T) {
 	}
 }
 
-// TestAESEnvelopeOpenSSL checks interoperability with an independent CMS
+// TestCBCEnvelopeOpenSSL checks interoperability with an independent CMS
 // implementation, which matters most for AES-192.
-func TestAESEnvelopeOpenSSL(t *testing.T) {
+func TestCBCEnvelopeOpenSSL(t *testing.T) {
 	if _, err := exec.LookPath("openssl"); err != nil {
 		t.Skip("openssl not installed")
 	}
@@ -76,7 +77,7 @@ func TestAESEnvelopeOpenSSL(t *testing.T) {
 	writePEM(t, certPath, "CERTIFICATE", caCert.Raw)
 	writePEM(t, keyPath, "RSA PRIVATE KEY", x509.MarshalPKCS1PrivateKey(caKey))
 
-	for _, alg := range aesCBCAlgorithms {
+	for _, alg := range cbcAlgorithms {
 		t.Run(alg.oid.String(), func(t *testing.T) {
 			der, err := alg.Encrypt(content, []*x509.Certificate{caCert})
 			if err != nil {
@@ -95,6 +96,67 @@ func TestAESEnvelopeOpenSSL(t *testing.T) {
 				t.Fatalf("openssl decrypted %q, want %q", out, content)
 			}
 		})
+	}
+}
+
+// TestDESEDE3KeyParity checks DES-EDE3 content keys have odd parity, as
+// OpenSSL's do; the round trip and openssl tests cover the rest.
+func TestDESEDE3KeyParity(t *testing.T) {
+	caCert, caKey := envelopetest.NewRecipient(t)
+
+	der, err := DESEDE3CBC.Encrypt([]byte("content"), []*x509.Certificate{caCert})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ed, err := Parse(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := ed.ContentEncryptionAlgorithm(); !got.Equal(pkcs7.OIDEncryptionAlgorithmDESEDE3CBC) {
+		t.Errorf("content encryption = %s, want %s", got, pkcs7.OIDEncryptionAlgorithmDESEDE3CBC)
+	}
+	recipient := ed.ed.recipientFor(caCert)
+	if recipient == nil {
+		t.Fatal("no recipient info for the CA certificate")
+	}
+	contentKey, err := decryptContentKey(recipient, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(contentKey) != 24 {
+		t.Fatalf("content key length = %d, want 24", len(contentKey))
+	}
+	for i, b := range contentKey {
+		if bits.OnesCount8(b)%2 != 1 {
+			t.Errorf("content key byte %d = %08b, want odd parity", i, b)
+		}
+	}
+}
+
+func TestZeroCBCEncrypt(t *testing.T) {
+	caCert, _ := envelopetest.NewRecipient(t)
+	var alg CBC
+	if _, err := alg.Encrypt([]byte("content"), []*x509.Certificate{caCert}); err == nil {
+		t.Fatal("expected an error for the zero CBC")
+	}
+}
+
+func TestSetDESParity(t *testing.T) {
+	for in, want := range map[byte]byte{
+		0x00: 0x01,
+		0x01: 0x01,
+		0xfe: 0xfe,
+		0xff: 0xfe,
+		0x80: 0x80,
+		0x81: 0x80,
+		0x02: 0x02,
+		0x03: 0x02,
+	} {
+		key := []byte{in}
+		setDESParity(key)
+		if key[0] != want {
+			t.Errorf("setDESParity(%08b) = %08b, want %08b", in, key[0], want)
+		}
 	}
 }
 
@@ -216,7 +278,7 @@ func TestUnsupportedByPKCS7(t *testing.T) {
 	otherCert.SerialNumber.SetInt64(43)
 	content := []byte("content")
 
-	encrypt := func(t *testing.T, alg AESCBC) []byte {
+	encrypt := func(t *testing.T, alg CBC) []byte {
 		der, err := alg.Encrypt(content, []*x509.Certificate{caCert})
 		if err != nil {
 			t.Fatal(err)
@@ -243,10 +305,12 @@ func TestUnsupportedByPKCS7(t *testing.T) {
 		want     bool
 	}{
 		{"DES", des, caCert, false},
+		{"DES-EDE3", func(t *testing.T) []byte { return encrypt(t, DESEDE3CBC) }, caCert, false},
 		{"AES-128", func(t *testing.T) []byte { return encrypt(t, AES128CBC) }, caCert, false},
 		{"AES-256", func(t *testing.T) []byte { return encrypt(t, AES256CBC) }, caCert, false},
 		{"AES-192", func(t *testing.T) []byte { return encrypt(t, AES192CBC) }, caCert, true},
 		{"AES-192 for another recipient", func(t *testing.T) []byte { return encrypt(t, AES192CBC) }, otherCert, true},
+		{"DES-EDE3 OAEP", func(t *testing.T) []byte { return oaep(t, encrypt(t, DESEDE3CBC)) }, caCert, true},
 		{"AES-256 OAEP", func(t *testing.T) []byte { return oaep(t, encrypt(t, AES256CBC)) }, caCert, true},
 		{"AES-256 OAEP for another recipient", func(t *testing.T) []byte { return oaep(t, encrypt(t, AES256CBC)) }, otherCert, false},
 	} {

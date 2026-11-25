@@ -135,6 +135,7 @@ func TestNewCSRRequest(t *testing.T) {
 
 var encryptionOIDs = map[string]asn1.ObjectIdentifier{
 	"des":    pkcs7.OIDEncryptionAlgorithmDESCBC,
+	"des3":   pkcs7.OIDEncryptionAlgorithmDESEDE3CBC,
 	"aes128": envelope.OIDAES128CBC,
 	"aes192": envelope.OIDAES192CBC,
 	"aes256": envelope.OIDAES256CBC,
@@ -240,6 +241,7 @@ func TestDecryptCertRep(t *testing.T) {
 		libraryFails bool
 	}{
 		{name: "DES", encryption: "des"},
+		{name: "DES-EDE3", encryption: "des3"},
 		{name: "AES-128", encryption: "aes128"},
 		{name: "AES-256", encryption: "aes256"},
 		{name: "AES-192", encryption: "aes192", libraryFails: true},
@@ -248,6 +250,12 @@ func TestDecryptCertRep(t *testing.T) {
 		}},
 		{name: "AES-256 OAEP default parameters", encryption: "aes256", rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
 			return envelopetest.DefaultOAEPParameters(t)
+		})},
+		{name: "DES-EDE3 OAEP absent parameters", encryption: "des3", libraryFails: true, rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
+			return nil
+		})},
+		{name: "DES-EDE3 OAEP SHA-256 with label", encryption: "des3", libraryFails: true, rewrap: oaep(crypto.SHA256, []byte("label"), func(t *testing.T) []byte {
+			return envelopetest.OAEPParameters(t, pkcs7.OIDDigestAlgorithmSHA256, pkcs7.OIDDigestAlgorithmSHA256, []byte("label"))
 		})},
 		{name: "AES-128 OAEP absent parameters", encryption: "aes128", libraryFails: true, rewrap: oaep(crypto.SHA1, nil, func(t *testing.T) []byte {
 			return nil
