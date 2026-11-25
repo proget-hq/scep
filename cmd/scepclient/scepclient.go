@@ -296,7 +296,7 @@ func main() {
 		flCAFingerprint           = flag.String("ca-fingerprint", "", "SHA-256 digest of CA certificate for NDES server. Note: Changed from MD5.")
 		flKeyEnciphermentSelector = flag.Bool("key-encipherment-selector", false, "Filter CA certificates by key encipherment usage")
 
-		flEncryptionAlgorithm = flag.String("encryption-algorithm", "des", "pkiMessage envelope encryption: des, aes128, aes192, aes256")
+		flEncryptionAlgorithm = flag.String("encryption-algorithm", "des", "pkiMessage envelope encryption: des, des3, aes128, aes192, aes256")
 		flSignatureAlgorithm  = flag.String("signature-algorithm", "sha1", "pkiMessage signature digest: sha1, sha256, sha384, sha512")
 
 		flDebugLogging = flag.Bool("debug", false, "enable debug logging")
