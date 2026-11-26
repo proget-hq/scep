@@ -82,10 +82,10 @@ func TestLoadCSRWithNonASCIISAN(t *testing.T) {
 func TestLoadOrMakeCSR(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "csr.pem")
 	opts := &csrOptions{
-		cn:       "client",
-		org:      "Proget",
-		dnsNames: []string{"client.example.com"},
-		key:      newTestKey(t),
+		cn:      "client",
+		org:     "Proget",
+		dnsName: "client.example.com",
+		key:     newTestKey(t),
 	}
 	made, err := loadOrMakeCSR(path, opts)
 	if err != nil {
@@ -106,9 +106,9 @@ func TestLoadOrMakeCSR(t *testing.T) {
 func TestLoadOrMakeCSRReportsCreateErrors(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "csr.pem")
 	_, err := loadOrMakeCSR(path, &csrOptions{
-		cn:       "client",
-		dnsNames: []string{"gęś.example.com"},
-		key:      newTestKey(t),
+		cn:      "client",
+		dnsName: "gęś.example.com",
+		key:     newTestKey(t),
 	})
 	if err == nil {
 		t.Fatal("expected an error for a dNSName crypto/x509 cannot write")
