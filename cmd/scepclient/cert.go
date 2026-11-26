@@ -12,6 +12,8 @@ import (
 	"math/big"
 	"os"
 	"time"
+
+	"github.com/micromdm/scep/v2/cryptoutil/x509util"
 )
 
 const (
@@ -96,5 +98,5 @@ func loadPEMCertFromFile(path string) (*x509.Certificate, error) {
 		return nil, errors.New("unmatched type or headers")
 	}
 
-	return x509.ParseCertificate(pemBlock.Bytes)
+	return x509util.ParseCertificate(pemBlock.Bytes)
 }
