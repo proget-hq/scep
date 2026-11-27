@@ -9,6 +9,7 @@ import (
 	"encoding/base64"
 	"errors"
 	"fmt"
+	"sync"
 
 	"github.com/go-kit/kit/log"
 	"github.com/smallstep/pkcs7"
@@ -39,11 +40,16 @@ var encryptionAlgorithms = map[string]envelopeEncrypter{
 	"aes256": pkcs7Encrypter(pkcs7.EncryptionAlgorithmAES256CBC),
 }
 
-// pkcs7Encrypter encrypts with the pkcs7 library. The library takes the cipher
-// from a package variable, which is fine for a CLI building one message at a
-// time.
+// pkcs7EncryptMu guards pkcs7.ContentEncryptionAlgorithm: the library takes
+// the cipher from a package variable, and the API server builds messages
+// concurrently.
+var pkcs7EncryptMu sync.Mutex
+
+// pkcs7Encrypter encrypts with the pkcs7 library.
 func pkcs7Encrypter(alg int) envelopeEncrypter {
 	return func(content []byte, recipients []*x509.Certificate) ([]byte, error) {
+		pkcs7EncryptMu.Lock()
+		defer pkcs7EncryptMu.Unlock()
 		pkcs7.ContentEncryptionAlgorithm = alg
 		return pkcs7.Encrypt(content, recipients)
 	}
