@@ -59,20 +59,7 @@ type runCfg struct {
 
 func run(cfg runCfg) error {
 	ctx := context.Background()
-	var logger log.Logger
-	{
-		if strings.ToLower(cfg.logfmt) == "json" {
-			logger = log.NewJSONLogger(os.Stderr)
-		} else {
-			logger = log.NewLogfmtLogger(os.Stderr)
-		}
-		stdlog.SetOutput(log.NewStdlibAdapter(logger))
-		logger = log.With(logger, "ts", log.DefaultTimestampUTC)
-		if !cfg.debug {
-			logger = level.NewFilter(logger, level.AllowInfo())
-		}
-	}
-	lginfo := level.Info(logger)
+	logger := newLogger(strings.ToLower(cfg.logfmt) == "json", cfg.debug)
 
 	client, err := scepclient.New(cfg.serverURL, logger)
 	if err != nil {
@@ -116,29 +103,6 @@ func run(cfg runCfg) error {
 		self = s
 	}
 
-	resp, certNum, err := client.GetCACert(ctx, cfg.caCertMsg)
-	if err != nil {
-		return err
-	}
-	var caCerts []*x509.Certificate
-	{
-		if certNum > 1 {
-			caCerts, err = scep.CACerts(resp)
-			if err != nil {
-				return err
-			}
-		} else {
-			caCerts, err = x509.ParseCertificates(resp)
-			if err != nil {
-				return err
-			}
-		}
-	}
-
-	if cfg.debug {
-		logCerts(level.Debug(logger), caCerts)
-	}
-
 	var signerCert *x509.Certificate
 	{
 		if cert != nil {
@@ -158,55 +122,18 @@ func run(cfg runCfg) error {
 		}
 	}
 
-	tmpl := &scep.PKIMessage{
-		MessageType: msgType,
-		Recipients:  caCerts,
-		SignerKey:   key,
-		SignerCert:  signerCert,
-	}
-
-	if cfg.challenge != "" && msgType == scep.PKCSReq {
-		tmpl.CSRReqMessage = &scep.CSRReqMessage{
-			ChallengePassword: cfg.challenge,
-		}
-	}
-
-	msg, err := newCSRRequest(csr, tmpl, cfg.caCertsSelector, cfg.encrypt, cfg.digest, logger)
+	respCert, err := enroll(ctx, client, enrollment{
+		key:             key,
+		csr:             csr,
+		signerCert:      signerCert,
+		msgType:         msgType,
+		caCertMsg:       cfg.caCertMsg,
+		caCertsSelector: cfg.caCertsSelector,
+		encrypt:         cfg.encrypt,
+		digest:          cfg.digest,
+	}, logger, cfg.debug)
 	if err != nil {
-		return errors.Wrap(err, "creating csr pkiMessage")
-	}
-
-	var respMsg *scep.PKIMessage
-
-	for {
-		// loop in case we get a PENDING response which requires
-		// a manual approval.
-
-		respBytes, err := client.PKIOperation(ctx, msg)
-		if err != nil {
-			return errors.Wrapf(err, "PKIOperation for %s", msgType)
-		}
-
-		respMsg, err = scep.ParsePKIMessage(respBytes, scep.WithLogger(logger), scep.WithCACerts(caCerts))
-		if err != nil {
-			return errors.Wrapf(err, "parsing pkiMessage response %s", msgType)
-		}
-
-		switch respMsg.PKIStatus {
-		case scep.FAILURE:
-			return errors.Errorf("%s request failed, failInfo: %s", msgType, respMsg.FailInfo)
-		case scep.PENDING:
-			lginfo.Log("pkiStatus", "PENDING", "msg", "sleeping for 30 seconds, then trying again.")
-			time.Sleep(30 * time.Second)
-			continue
-		}
-		lginfo.Log("pkiStatus", "SUCCESS", "msg", "server returned a certificate.")
-		break // on scep.SUCCESS
-	}
-
-	respCert, err := decryptCertRep(respMsg, signerCert, key)
-	if err != nil {
-		return errors.Wrapf(err, "decrypt pkiEnvelope, msgType: %s, status %s", msgType, respMsg.PKIStatus)
+		return err
 	}
 
 	if err := ioutil.WriteFile(cfg.certPath, pemCert(respCert.Raw), 0666); err != nil {
@@ -221,6 +148,22 @@ func run(cfg runCfg) error {
 	}
 
 	return nil
+}
+
+// newLogger logs to stderr, debug messages only if debug is set.
+func newLogger(json, debug bool) log.Logger {
+	var logger log.Logger
+	if json {
+		logger = log.NewJSONLogger(os.Stderr)
+	} else {
+		logger = log.NewLogfmtLogger(os.Stderr)
+	}
+	stdlog.SetOutput(log.NewStdlibAdapter(logger))
+	logger = log.With(logger, "ts", log.DefaultTimestampUTC)
+	if !debug {
+		logger = level.NewFilter(logger, level.AllowInfo())
+	}
+	return logger
 }
 
 // logCerts logs the count, number, RDN, and fingerprint of certs to logger
@@ -304,6 +247,9 @@ func main() {
 
 		flDebugLogging = flag.Bool("debug", false, "enable debug logging")
 		flLogJSON      = flag.Bool("log-json", false, "use JSON for log output")
+
+		flListen     = flag.String("listen", "", "serve the enroll API on this address (e.g. :8080) instead of enrolling once; requires the bearer token in "+apiTokenEnv+" if set")
+		flAPITimeout = flag.Duration("api-timeout", 60*time.Second, "time limit of one enrollment through the API")
 	)
 
 	flag.Parse()
@@ -312,6 +258,15 @@ func main() {
 	if *flVersion {
 		fmt.Println(version)
 		os.Exit(0)
+	}
+
+	if *flListen != "" {
+		logger := newLogger(*flLogJSON, *flDebugLogging)
+		if err := serve(*flListen, *flAPITimeout, logger, *flDebugLogging); err != nil {
+			level.Error(logger).Log("msg", "serving the enroll API", "err", err)
+			os.Exit(1)
+		}
+		return
 	}
 
 	if err := validateFlags(*flPKeyPath, *flServerURL, *flCAFingerprint, *flKeyEnciphermentSelector); err != nil {

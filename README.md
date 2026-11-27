@@ -139,6 +139,10 @@ Usage of ./scepclient-linux-amd64:
     	pkiMessage envelope encryption: des, des3, aes128, aes192, aes256 (default "des")
   -keySize int
     	rsa key size (default 2048)
+  -api-timeout duration
+    	time limit of one enrollment through the API (default 1m0s)
+  -listen string
+    	serve the enroll API on this address (e.g. :8080) instead of enrolling once; requires the bearer token in SCEPCLIENT_API_TOKEN if set
   -locality string
     	locality for certificate
   -log-json
@@ -167,6 +171,43 @@ This most likely uses the `/certsrv/mscep` path. You will need to add the `-ca-f
 The defaults (`des`, `sha1`) match the upstream client. Prefer an AES cipher and a SHA-2 digest supported by your server (see its `GetCACaps`), or `des3` for a server that lists `DES3` but not `AES`. `scepserver` (and the `server` package) decrypts requests in all of them, `aes192` included.
 
 If you're not sure which SHA-256 hash (for a specific CA) to use, you can use the `-debug` flag to print them out for the CAs returned from the SCEP server.
+
+### Enroll API
+
+`scepclient -listen :8080` serves the enrollment over HTTP instead of running it once, for a caller that should not start processes (say, an application in a container with a process limit). It keeps nothing on disk: the key and the CSR come with the request, the certificate goes back in the response.
+
+If `SCEPCLIENT_API_TOKEN` is set, `POST /v1/enroll` requires `Authorization: Bearer <token>`. The key travels in the request, so serve the API on an internal network only. `GET /healthz` answers `{"status":"ok","version":"..."}` without a token.
+
+```
+POST /v1/enroll
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+  "server_url": "https://ndes.example.com/certsrv/mscep/mscep.dll",
+  "private_key": "-----BEGIN RSA PRIVATE KEY-----\n...",
+  "csr": "-----BEGIN CERTIFICATE REQUEST-----\n...",
+  "cacert_message": "",
+  "encryption_algorithm": "aes128",
+  "signature_algorithm": "sha256",
+  "ca_fingerprint": "",
+  "key_encipherment_selector": false
+}
+
+200 OK
+{"certificate": "-----BEGIN CERTIFICATE-----\n..."}
+```
+
+The request is a PKCSReq, as the CLI sends without a certificate to renew: `private_key` is an RSA key (PKCS #1 or PKCS #8 PEM), `csr` a PEM request for it, with the challenge password the server expects as an attribute. The other fields take the values of the flags of the same name and are optional; `encryption_algorithm` and `signature_algorithm` default to `des` and `sha1`, as the flags do.
+
+Errors come as `{"error": "..."}` with:
+
+| Status | Meaning |
+|--------|---------|
+| 400 | The request is not valid (JSON, key, CSR not for the key, algorithm, selectors). |
+| 401 | The token is missing or wrong. |
+| 502 | The SCEP server failed: not reachable, an answer that is not SCEP, or a CertRep with pkiStatus FAILURE, when `fail_info` has its failInfo (`0` badAlg, `1` badMessageCheck, `2` badRequest, `3` badTime, `4` badCertId). |
+| 504 | The enrollment did not finish within `-api-timeout`; a PENDING request is polled every 30 seconds until then. |
 
 ## Docker
 
